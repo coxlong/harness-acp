@@ -1,0 +1,13 @@
+# Binaries
+/harnessd
+/bin/
+/dist/
+
+# Test and coverage output
+*.out
+coverage.*
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
