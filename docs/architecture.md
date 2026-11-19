@@ -1,7 +1,7 @@
 # harnessd 架构设计
 
-> 状态：定案（待实现）
-> 更新：2026-11-19
+> 状态：定案（待实现；§17 为评审修订记录）
+> 更新：2026-11-19（修订 r2）
 
 ## 1. 概述
 
@@ -64,7 +64,8 @@ harnessd 里存在三个**互不要求生命周期一致**的状态机。这是�
 | 南向进程崩溃 | 已连接的 app 收到错误 | 绑定它的会话标记 failed | 重启策略决定是否重建 |
 | 南向进程重启 | 无直接事件 | 需 `ThreadResume` / `--resume` 重建原生会话 | 新进程 |
 | `session/close` | 无影响 | 释放资源 | 独占型退出 |
-| 同一会话并发 prompt | 后到连接被拒或降级为观察者 | 由租约裁决 | 只跑一个 turn |
+| 同一会话并发 prompt | 并入正在跑的 foreground work（v2 语义，见 §6.1） | 单 turn 互斥，后到 prompt 作为 steer 并入 | 只跑一个 turn |
+| 多个连接 attach 同一会话 | 均为订阅者；权限请求只发给最近 attach 的一个 | 订阅者列表 | 不变 |
 
 ## 4. 分层与项目结构
 
@@ -85,7 +86,9 @@ harnessd 里存在三个**互不要求生命周期一致**的状态机。这是�
 └────────────────────────────────────────────────────────────────┘
 ```
 
-**铁律**：`acphttp.NewServer(serve)` 的 `serve` 回调**每条连接调用一次**，所以那里创建的 `acp2.Agent` 天生是连接级的。它必须无状态——一旦把会话存进 facade 结构体，ws 一断会话就死，`session/resume` 永远不可能工作。
+**铁律 1**：`acphttp.NewServer(serve)` 的 `serve` 回调**每条连接调用一次**，所以那里创建的 `acp2.Agent` 天生是连接级的。它必须无状态——一旦把会话存进 facade 结构体，ws 一断会话就死，`session/resume` 永远不可能工作。
+
+**铁律 2：turn 归会话层，不归连接。** acp-go 的 `TurnTracker`（`SessionManager.StartTurn/JoinTurn` 所用）会通过 `context.AfterFunc(conn, cancel)` 在连接关闭时取消 turn（`turn.go:start`）。这与「ws 断开 turn 继续跑」直接冲突，因此：**不使用 acp-go 的 turn 管理**，turn 的启停、取消、互斥全部由 `session/` 持有，facade 只负责「发起 / 订阅 / 转发取消」。可复用 `SessionManager` 的会话表与 list 分页，但不得调用其 turn 相关方法。
 
 > 命名说明：之前讨论的 `BackendPool` 收敛为「**每个 agent 一个进程级单例 Backend**」+「**Backend 产出的会话级 SessionHandle**」，不再单独引入 Pool 概念，避免多一层无实义的抽象。
 
@@ -99,18 +102,19 @@ harness-acp/
 │   │   ├── server.go           #   mux + acphttp + /v1/agents + stdio 模式
 │   │   ├── facade.go           #   acp2.Agent 无状态门面
 │   │   └── router.go           #   /acp/{name} → Backend
-│   ├── session/                # SessionRegistry：会话表、租约、事件缓冲、订阅者
+│   ├── session/                # SessionRegistry：会话表、turn 互斥、订阅者、断线补发缓冲、权限仲裁
 │   ├── backend/
 │   │   ├── backend.go          #   Backend / SessionHandle 接口
 │   │   ├── codex/              #   共享 app-server + thread 分发 + 事件翻译
 │   │   │   ├── runtime.go      #     进程、JSON-RPC、按 threadId 分发
 │   │   │   ├── session.go      #     thread 级会话
-│   │   │   └── translate.go    #     原生事件 → acp2.SessionUpdate
+│   │   │   ├── translate.go    #     原生事件 → acp2.SessionUpdate
+│   │   │   └── history.go      #     ThreadRead → 历史快照（§10.3）
 │   │   └── claude/             #   按会话进程 + 空闲回收 + 事件翻译
-│   │       ├── runtime.go      #     进程池、租约、回收
+│   │       ├── runtime.go      #     进程池、回收
 │   │       ├── session.go      #     stream-json turn 循环
-│   │       └── translate.go    #     原生事件 → acp2.SessionUpdate
-│   ├── perm/                   # ACP 权限请求的构造与仲裁（codex/claude 共用）
+│   │       ├── translate.go    #     原生事件 → acp2.SessionUpdate
+│   │       └── history.go      #     读 transcript：list 与完整历史（§10.3）
 │   └── version/
 ├── docs/
 └── go.mod
@@ -178,26 +182,38 @@ GET /v1/agents
 
 ## 6. 南向：Backend 抽象
 
+### 6.1 v2 的 prompt 语义（接口设计的前提）
+
+acp2 的 `Prompt` **在消息被接受时就返回**；turn 结束由 `state_update: idle(stopReason)` 通知，期间新 prompt 可并入正在跑的 foreground work。因此南向接口不能是「`Prompt` 阻塞到 `StopReason`」，而是「发送 + 事件流」。这也正好对应两个原生协议：codex 的 `turn/start` / `turn/steer`、claude 的「往 stdin 写一行」。
+
 ```go
 // Backend 是「一个 agent」的进程级单例，进程模型由实现自己决定。
 type Backend interface {
     Name() string
-    Probe(ctx context.Context) (AgentInfo, error)      // 版本、可用性
+    Probe(ctx context.Context) (AgentInfo, error)       // 版本、可用性
+    // list 与完整历史的数据源在后端（§10.3），harnessd 不存。
     ListSessions(ctx context.Context, f ListFilter) ([]SessionInfo, string, error)
+    History(ctx context.Context, id string) ([]acp2.SessionUpdate, error)  // 实体级快照，已含 primer
     NewSession(ctx context.Context, p NewSessionParams) (SessionHandle, error)
     ResumeSession(ctx context.Context, id string, p ResumeParams) (SessionHandle, error)
-    Close() error                                       // harnessd 退出时调用
+    Close() error                                        // harnessd 退出时调用
 }
 
 // SessionHandle 是会话级句柄：一个 ACP session 对应一个。
+// 事件不通过回调返回，而是写入 Events()，由 session/ 消费、编号、扇出。
 type SessionHandle interface {
     NativeID() string
-    Prompt(ctx context.Context, blocks []acp2.ContentBlock,
-           emit func(acp2.SessionUpdate) error) (acp2.StopReason, error)
+    // Send 提交一条用户消息：空闲则开新 turn，运行中则并入（steer）。
+    // 返回 messageID（v2 要求保留）。turn 的结束以 Events() 里的 idle 状态事件表示。
+    Send(ctx context.Context, blocks []acp2.ContentBlock) (acp2.MessageID, error)
+    Events() <-chan Event            // SessionUpdate | PermissionRequest | Fatal
+    Respond(reqID string, d Decision) error   // 回应权限请求
     Cancel(ctx context.Context) error
     Close(ctx context.Context) error
 }
 ```
+
+`Event` 里的 `PermissionRequest` 与 `SessionUpdate` 走同一个通道，保证权限请求与其前后的 tool call 更新保持顺序。
 
 两者职责分离的理由：**翻译逻辑是会话级的，OS 进程是进程级的**。codex 一个进程服务多会话，若把进程所有权写进 SessionHandle，第一个会话结束就会误杀进程。
 
@@ -218,6 +234,9 @@ type SessionHandle interface {
 | `session/new` | `ThreadStart` → `threadId` |
 | `session/resume` | `ThreadResume{threadId, cwd, ...}` |
 | `session/list` | `ThreadList{cwd, archived, cursor, ...}`（可直接代理） |
+| 完整历史（`replayFrom: start`） | `ThreadRead{includeTurns:true}` → 翻译为实体级快照 |
+| 并发 prompt | `TurnSteer`（并入运行中的 turn） |
+| `cancel` | `TurnInterrupt` |
 | `session/close` | 释放内存中的 thread 绑定（不 Archive） |
 
 `ThreadStartParams` 支持**线程级**的 `cwd`、`model`、`sandbox`、`approvalPolicy`、`modelProvider`、`config`、`developerInstructions` 等——**所以共享进程不破坏会话隔离**，每个会话仍可各有自己的目录与配置。这是「共用一个进程」决定成立的前提。
@@ -233,7 +252,7 @@ app-server stdout
 ```
 
 - 查不到 threadId 的事件：记录日志后丢弃（可能是其他客户端的线程）。
-- 每个会话有独立的 outbound 队列，**慢消费者不阻塞其他会话**。
+- 每个会话有独立的 outbound 队列，**慢消费者不阻塞其他会话**。队列写满时策略：**断开该订阅者的连接**（让它走重连 + 补发），不丢帧、不阻塞后端。
 
 ### 7.4 事件翻译
 
@@ -299,15 +318,17 @@ claude --print \
 
 已实测：`--resume` 与 `--input-format/-output-format stream-json` 可组合。
 
+**待 M0 验证**：权限回路所需的 flag（当前 CLI 有 `--permission-prompts host|none`，默认 `host`，另有 `--permission-prompt-tool`）。8.2 命令行尚未包含它，`control_request(can_use_tool)` 在 `--print` + stream-json 下的触发条件以实测为准（参考 `claude-agent-acp` 对 SDK 的用法）。
+
 ### 8.3 turn 循环
 
 - 一轮 = 往 stdin 写**一行** JSON（用户消息）。
 - 结束判据 = stdout 出现 `{"type":"result", ...}`（含 `session_id`、`stop_reason`、`usage`）。
 - 进程在 `result` 之后**保持存活**等待下一次输入，这是长驻模式的基础。
 
-### 8.4 租约（必须）
+### 8.4 单进程互斥（必须）
 
-`--resume` 的行为是：会话若正被另一进程运行，**会 fork 出一个副本并告知**。所以同一会话绝不能有两个进程同时存在。由 `SessionRegistry` 的会话租约保证：一个会话同时只有一个活跃进程 / 一个正在跑的 turn。
+`--resume` 的行为是：会话若正被另一进程运行，**会 fork 出一个副本并告知**。所以同一会话绝不能有两个进程同时存在。`session/` 对每个会话持一把互斥量：冷路径 spawn 前先持锁并确认旧进程已退出；一个会话同时只有一个进程、一个 turn。这是普通互斥，不再单独抽象为「租约」。
 
 ### 8.5 事件翻译
 
@@ -324,7 +345,7 @@ claude --print \
 | 参数 | 建议初值 | 说明 |
 |---|---|---|
 | 进程空闲 TTL | 30 min（可配） | 到期 kill 进程，保留 uuid |
-| 会话元数据 TTL | 无（内存索引随进程） | 见 §10 |
+| 会话元数据 TTL | 无 | list 由扫描 transcript 得出（§10.3），不依赖内存 |
 
 ## 9. 权限回路
 
@@ -355,13 +376,12 @@ claude stdout: {"type":"control_request","request":{...,"subtype":"can_use_tool"
 claude stdin:  {"type":"control_response", ...}   ← app 的决定
 ```
 
-### 9.3 断连时的权限处理
+### 9.3 无人在线时的权限处理
 
-app 断开而权限请求未决：
+权限请求只发给**最近 attach 的**订阅者。无订阅者（断连或无人 attach）时：
 
-- 默认：**拒绝**（fail-safe），并通知 claude/codex。
-- 可选配置：保持挂起直到超时（默认 60s）后拒绝。
-- 绝不默认放行。
+- **立即拒绝**（fail-safe），并通知 claude/codex。
+- 绝不默认放行；不做「挂起等待重连」的配置项（复杂度高、收益低，需要时再加）。
 
 ## 10. 会话生命周期、重连与回放
 
@@ -370,9 +390,9 @@ app 断开而权限请求未决：
 | 数据 | 是否落盘 | 理由 |
 |---|---|---|
 | `sessionId ↔ native id` 映射 | **否** | 直接令 ACP `sessionId` = 后端原生 id（codex 的 `ThreadId`、claude 由 `--session-id` 指定的 UUID），无映射即无状态 |
-| 会话元数据（list） | **否** | codex 代理 `ThreadList`；claude 用内存索引（v1 限制） |
-| 事件缓冲（回放） | **否** | 只需跨连接，内存环形缓冲足够 |
-| 租约 / owner | **否** | 进程内状态 |
+| 会话元数据（list） | **否** | codex 代理 `ThreadList`；claude 扫描 `~/.claude/projects/` transcript 目录（见 §10.3） |
+| 断线补发缓冲 | **否** | 内存环形缓冲，仅跨连接补发；完整历史由后端提供 |
+| 单进程互斥 | **否** | 进程内互斥量 |
 | 配置 | 配置文件 | 常规配置，不是运行时状态 |
 
 **原则：harnessd 不拥有会话数据，只拥有「活着的进程」和「内存里的连接/事件状态」。真相在后端。**
@@ -387,29 +407,40 @@ ws 层**没有连接 id，也不可能有**：一条 socket 就是一条连接�
 
 ### 10.3 回放
 
-v2 在 `session/resume` 上提供 `replayFrom`：
+v2 `session/resume` 的 `replayFrom` 有两个独立用途，对应两套不同的数据来源：
 
-| cursor | 含义 |
-|---|---|
-| 省略 | 不回放（从当前继续） |
-| `{"type":"start"}` | 回放全部保留的历史 |
-| `{"type":"_harness/seq","seq":N}` | harnessd 私有游标（`_` 前缀为规范保留的扩展位），从第 N 条之后补齐 |
+| cursor | 用途 | 数据来源 |
+|---|---|---|
+| 省略 / `null` | 不回放，从当前继续 | — |
+| `{"type":"start"}` | 回放完整历史（全部保留的会话实体） | **后端提供**（见下） |
+| `{"type":"_harness/seq","seq":N}` | 断线补发：从第 N 条之后补齐 | 内存环形缓冲 |
 
-实现：`SessionRegistry` 给每个会话维护**环形缓冲**（容量可配，如 2000 条），每条 `SessionUpdate` 带单调序号；回放结束发 `SessionUpdateReplayComplete`。
+**完整历史（`replayFrom: start`）的数据来源**
 
-**缺口处理**：若请求的 seq 早于缓冲起点（丢得太多），`-32602` 拒绝，让 app 改用 `{"type":"start"}` 或重建会话——不静默跳过。
+- **codex**：`ThreadRead{threadId, includeTurns:true}` → 以 turn 为单位遍历，翻译成实体级快照（消息、tool call、plan 各自的当前状态，而非逐 delta 重放）。
+- **claude**：扫描 `~/.claude/projects/<cwd-hash>/*.jsonl` transcript，解析后翻译成实体级快照。两个后端均在 `internal/backend/{codex,claude}/history.go` 实现。
+
+这样 harnessd 重启后 `replayFrom: start` 仍然可用，不依赖内存缓冲。
+
+**回放中的 chunk 实体规则**（v2 规范要求）：凡是有 chunk 变体的实体（消息、tool call 内容、终端输出、compaction summary），回放时须先发一条空内容的"primer"更新，再发 chunk，防止客户端将本次 chunk 追加到上次连接已持有的内容上。
+
+**断线补发（`_harness/seq`）**：`SessionRegistry` 给每个活跃会话维护**环形缓冲**（容量可配，如 500 条），每条 `SessionUpdate` 带单调序号。短暂断线后用此游标补发，无需读磁盘。缓冲覆盖不到时返回 `-32602`，让 app 改用 `{"type":"start"}`，不静默跳过。
+
+回放结束发 `SessionUpdateReplayComplete`（无论历史是否为空）。
 
 ### 10.4 回收
 
 ```text
 socket 断开
-  ├─ 立即：解绑 socket、销毁 facade；会话继续跑，事件进缓冲
+  ├─ 立即：解绑订阅者、销毁 facade；会话继续跑，事件进环形缓冲
   ├─ 会话空闲 TTL 到期且无订阅者
   │     ├─ 杀独占进程（claude）/ 保留共享进程（codex）
-  │     ├─ 释放事件缓冲
-  │     └─ 保留元数据（id / cwd / 标题）→ list 仍可见，resume 触发重建
-  └─ 死连接检测：ws ping（15s）判定；HTTP 用 acphttp idle timeout
+  │     ├─ 释放环形缓冲
+  │     └─ 会话 id 仍可 resume（从后端 transcript/thread 重建）
+  └─ 死连接检测：acphttp.WithWebSocketPing + acphttp.WithIdleTimeout
 ```
+
+慢消费者（订阅者的队列写满）：**断开该连接**，让其走重连 + 断线补发，不丢帧、不阻塞后端进程。
 
 ## 11. 安全模型
 
@@ -441,12 +472,17 @@ agent 本质是**任意代码执行**，而 app 可能来自异机。默认配�
 |---|---|---|
 | ACP 版本 | 北向只用 v2 | 需求方指定；v1 不做 |
 | SDK | ironpark/acp-go | 内置 v2 + ws transport，覆盖完整（见 `ironpark-analysis.md`） |
+| acp-go SessionManager 复用范围 | 复用会话表与 list 分页；**不用其 turn 相关方法** | `TurnTracker` 在连接关闭时取消 turn，与断线后 turn 继续的核心承诺冲突 |
 | Node 转换进程 | 不用 | 要求单二进制 |
 | codex 进程 | 共享一个 `app-server` | 线程级参数保证隔离；减少进程数 |
 | codex daemon | 不用 | 会话持久化靠 `ThreadResume` 即可；daemon 是机器级共享，带来跨工具干扰、版本漂移、`update` 打断风险 |
 | claude 多轮 | 长驻进程 + 空闲回收 + `--resume` 冷路径 | 快路径零冷启动，冷路径保证恢复 |
+| claude session/list | 扫描 `~/.claude/projects/` transcript 目录 | 进程内存不跨重启；transcript 由 claude 本身维护，无需 harnessd 落盘 |
+| 完整历史数据来源 | 从后端读取（codex: `ThreadRead`；claude: transcript） | 内存缓冲覆盖不到重启；后端本身有完整历史 |
 | 持久化 | 无 | 真相在后端；避免 DB/迁移/一致性问题 |
 | 会话 id | 等于后端原生 id | 无映射表即无状态 |
+| perm/ 单独包 | 不建 | 两边形态不同，共用的只有「构造 RequestPermission + 断连即拒绝」，放进 `session/` 足够 |
+| 并发 prompt | 并入运行中 turn（v2 语义） | v2 Prompt 在消息接受时返回；后续 prompt 作为 steer 并入，不拒绝 |
 
 ## 14. 风险与对策
 
@@ -469,13 +505,24 @@ agent 本质是**任意代码执行**，而 app 可能来自异机。默认配�
 | **M3** | codex 完整：工具调用、计划、usage、权限、取消、`session/list` | 工具与权限可透传；list 对齐 `ThreadList` |
 | **M4** | claude 打通：每会话进程、turn 循环、事件翻译 | 文本流、工具调用可用 |
 | **M5** | claude 完整：权限控制回路、空闲回收、`--resume` 冷路径 | 崩溃/重启后可恢复；权限可通到 app |
-| **M6** | 重连回放：环形缓冲、`replayFrom`、`replay_complete` | 断线重连不丢事件（在缓冲窗口内） |
+| **M6** | 重连回放：断线补发环形缓冲 + `_harness/seq`；`replayFrom:start` 从后端读取完整历史；`replay_complete` | 断线重连不丢事件（缓冲窗口内）；harnessd 重启后 `start` 仍可用 |
 | **M7** | 安全与运维：token、TLS、origin、cwd 白名单、审计日志 | 违例请求全部被拒 |
 
 ## 16. 待实测（M0 Spike 清单）
 
-1. claude 常驻进程的实际内存占用 → 决定默认 TTL / 并发上限
-2. `--resume` 冷启动耗时（会话长短不同）→ 决定是否值得默认常驻
-3. stream-json 在 `result` 之后进程等待 stdin 的确切行为（是否有超时/心跳）
-4. `codex app-server` 是否并发处理多个 thread 的 turn，还是串行 → 决定是否需要队列
-5. `ThreadList` 的返回是否包含 harnessd 自己创建的全部线程（originators 过滤）
+**下列第 4 项最优先**，其结果直接决定 §7.3 的队列设计。
+
+1. `codex app-server` 是否并发处理多个 thread 的 turn，还是串行 → 决定是否需要每会话独立队列（**最高优先**）
+2. claude 常驻进程的实际内存占用 → 决定默认空闲 TTL / 并发上限
+3. `--resume` 冷启动耗时（会话长短不同）→ 决定是否值得默认常驻
+4. stream-json 在 `result` 之后进程等待 stdin 的确切行为（是否有超时 / 心跳）
+5. `--permission-prompts host` + `--print` + stream-json 下 `control_request(can_use_tool)` 的确切触发条件（§9.2 的前提，M4/M5 之前需落实）
+6. claude `~/.claude/projects/` transcript 目录结构 → 验证 §10.3 的 session/list 实现路径
+7. `ThreadList` 的返回是否包含 harnessd 自己创建的全部线程（originators 过滤）
+
+## 17. 修订记录
+
+| 版本 | 日期 | 修订内容 |
+|---|---|---|
+| r1 | 2026-11-19 | 初版定案 |
+| r2 | 2026-11-19 | **设计评审修订**：(1) §6 重写 Backend/SessionHandle 接口，对齐 v2 prompt 语义（消息接受即返回，turn 结束由 idle 事件通知，并发 prompt 并入而非拒绝）；(2) §3 补充「turn 不能随连接取消」铁律，说明不得使用 acp-go TurnTracker；(3) §7.2 补充 TurnSteer / TurnInterrupt 映射，§7.3 明确慢消费者策略（断连而非丢帧）；(4) §8.4 将「租约」改为普通互斥量；(5) §9.3 去掉「挂起等待重连」配置项，改为立即拒绝；(6) §10.1 更新表格，§10.3 拆分完整历史与断线补发两套机制，完整历史由后端提供（codex: ThreadRead，claude: transcript），修正 chunk 实体回放的 primer 规则；(7) §10.4 更新回收流程描述；(8) §13 补充 7 条新决策；(9) §15 M6 更新验收描述；(10) §16 补充 permission 回路和 transcript 目录两个验证项，重排优先级 |
