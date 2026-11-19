@@ -8,6 +8,8 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/local/bin/harnessd
 Environment=HARNESSD_LISTEN=127.0.0.1:7800
+# systemd starts with a minimal PATH; the agent CLIs live in ~/.local/bin.
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # Environment=HARNESSD_TOKEN=change-me
 Restart=on-failure
 RestartSec=2
