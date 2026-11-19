@@ -1,0 +1,13 @@
+# harnessd (ACP v2) - reverse proxy
+#
+# harnessd listens on 127.0.0.1:7800; Caddy exposes it.
+# To use a domain with automatic HTTPS, replace ":80" with the domain name
+# (e.g. "acp.example.com") and point DNS at this machine.
+
+:80 {
+	# Streaming-friendly: disable response buffering so ACP event streams
+	# (Streamable HTTP / SSE) and WebSocket upgrades pass through immediately.
+	reverse_proxy 127.0.0.1:7800 {
+		flush_interval -1
+	}
+}
