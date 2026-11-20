@@ -137,14 +137,26 @@ func configDir() string {
 
 // findTranscript locates a session's transcript in any project directory.
 func findTranscript(id string) (string, error) {
-	if id == "" || strings.ContainsAny(id, `/\.`) {
-		return "", fmt.Errorf("invalid session id %q", id)
+	if !validSessionID(id) {
+		return "", invalidSessionID(id)
 	}
 	matches, _ := filepath.Glob(filepath.Join(configDir(), "projects", "*", id+".jsonl"))
 	if len(matches) == 0 {
-		return "", fmt.Errorf("session %s not found", id)
+		return "", &backend.SessionNotFoundError{ID: id}
 	}
 	return matches[0], nil
+}
+
+// validSessionID reports whether id names a session file and nothing else: no
+// empty name and no path separators, so it cannot escape its directory.
+func validSessionID(id string) bool {
+	return id != "" && !strings.ContainsAny(id, `/\.`)
+}
+
+// invalidSessionID is the client-input error for a session id that cannot be
+// a transcript name.
+func invalidSessionID(id string) error {
+	return backend.InvalidParams("invalid session id %q", id)
 }
 
 // userText returns the text of a user message: its string content, or its

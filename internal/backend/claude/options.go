@@ -246,7 +246,7 @@ func effortName(l string) string {
 func (s *Session) SetConfigOption(ctx context.Context, id string, value any) ([]acp2.SessionConfigOption, error) {
 	str, ok := value.(string)
 	if !ok {
-		return nil, fmt.Errorf("invalid params: config option %q takes a string value, got %v", id, value)
+		return nil, backend.InvalidParams("config option %q takes a string value, got %v", id, value)
 	}
 	s.mu.Lock()
 	info := s.info
@@ -261,13 +261,13 @@ func (s *Session) SetConfigOption(ctx context.Context, id string, value any) ([]
 	switch id {
 	case configMode:
 		if !slices.ContainsFunc(availableModes(info, cfg), func(m modeInfo) bool { return m.id == str }) {
-			return nil, fmt.Errorf("invalid params: invalid value for config option %s: %s", id, str)
+			return nil, backend.InvalidParams("invalid value for config option %s: %s", id, str)
 		}
 		body = map[string]any{"subtype": "set_permission_mode", "mode": str}
 		cfg.mode = str
 	case configModel:
 		if findModel(info.Models, str) == nil {
-			return nil, fmt.Errorf("invalid params: invalid value for config option %s: %s", id, str)
+			return nil, backend.InvalidParams("invalid value for config option %s: %s", id, str)
 		}
 		body = map[string]any{"subtype": "set_model", "model": str}
 		cfg.model = str
@@ -283,7 +283,7 @@ func (s *Session) SetConfigOption(ctx context.Context, id string, value any) ([]
 	case configEffort:
 		m := currentModel(info, cfg)
 		if str != "default" && (m == nil || !slices.Contains(m.SupportedEffortLevel, str)) {
-			return nil, fmt.Errorf("invalid params: invalid value for config option %s: %s", id, str)
+			return nil, backend.InvalidParams("invalid value for config option %s: %s", id, str)
 		}
 		if str == "default" {
 			str = ""
@@ -295,7 +295,7 @@ func (s *Session) SetConfigOption(ctx context.Context, id string, value any) ([]
 		body = map[string]any{"subtype": "apply_flag_settings", "settings": map[string]any{"effortLevel": level}}
 		cfg.effort = str
 	default:
-		return nil, fmt.Errorf("invalid params: unknown config option %q", id)
+		return nil, backend.InvalidParams("unknown config option %q", id)
 	}
 
 	// A live process learns it now; without one the value rides the next start.

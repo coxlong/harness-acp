@@ -47,6 +47,29 @@ func NewFacade(name string, be backend.Backend, reg *session.Registry, allowDirs
 	}
 }
 
+// backendError turns a backend error into the ACP error the protocol assigns
+// it: typed client-input problems keep their class (-32602 invalid params,
+// -32002 unknown session with data.sessionId), and anything else is wrapped
+// with the operation's name and reported as an internal error.
+func backendError(err error, op string) error {
+	var ip *backend.InvalidParamsError
+	if errors.As(err, &ip) {
+		return acp.InvalidParams(ip.Detail)
+	}
+	var gone *backend.CwdNotExistError
+	if errors.As(err, &gone) {
+		return acp.InvalidParams(gone.Error())
+	}
+	var missing *backend.SessionNotFoundError
+	if errors.As(err, &missing) {
+		return acp.SessionNotFound(missing.ID)
+	}
+	if op != "" {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	return err
+}
+
 // Initialize negotiates the ACP v2 protocol version.
 func (f *Facade) Initialize(_ context.Context, _ *acp2.InitializeRequest) (*acp2.InitializeResponse, error) {
 	return &acp2.InitializeResponse{
@@ -59,7 +82,7 @@ func (f *Facade) Initialize(_ context.Context, _ *acp2.InitializeRequest) (*acp2
 func (f *Facade) NewSession(ctx context.Context, params *acp2.NewSessionRequest) (*acp2.NewSessionResponse, error) {
 	cwd := string(params.Cwd)
 	if !cwdAllowed(cwd, f.allowDirs) {
-		return nil, fmt.Errorf("invalid params: cwd %q is not under an allowed root", cwd)
+		return nil, acp.InvalidParams(fmt.Sprintf("cwd %q is not under an allowed root", cwd))
 	}
 	var addDirs []string
 	for _, d := range params.AdditionalDirectories {
@@ -68,7 +91,8 @@ func (f *Facade) NewSession(ctx context.Context, params *acp2.NewSessionRequest)
 
 	handle, err := f.be.NewSession(ctx, backend.NewSessionParams{Cwd: cwd, AdditionalDirectories: addDirs})
 	if err != nil {
-		return nil, fmt.Errorf("new session: %w", err)
+		log.Printf("new session rejected: cwd=%s: %v", cwd, err)
+		return nil, backendError(err, "new session")
 	}
 	id := handle.NativeID()
 	f.reg.Register(id, f.name, handle)
@@ -97,7 +121,7 @@ func (f *Facade) GetSessionOptions(ctx context.Context, params *acp2.SessionOpti
 	}
 	cwd := string(params.Cwd)
 	if !cwdAllowed(cwd, f.allowDirs) {
-		return nil, fmt.Errorf("invalid params: cwd %q is not under an allowed root", cwd)
+		return nil, acp.InvalidParams(fmt.Sprintf("cwd %q is not under an allowed root", cwd))
 	}
 	var dirs []string
 	for _, d := range params.AdditionalDirectories {
@@ -105,7 +129,7 @@ func (f *Facade) GetSessionOptions(ctx context.Context, params *acp2.SessionOpti
 	}
 	o, err := f.be.Options(ctx, cwd, dirs)
 	if err != nil {
-		return nil, err
+		return nil, backendError(err, "session options")
 	}
 	return &acp2.SessionOptionsResponse{ConfigOptions: o.Config, AvailableCommands: o.Commands}, nil
 }
@@ -115,7 +139,7 @@ func (f *Facade) GetSessionOptions(ctx context.Context, params *acp2.SessionOpti
 func (f *Facade) SetSessionConfigOption(ctx context.Context, params *acp2.SetSessionConfigOptionRequest) (*acp2.SetSessionConfigOptionResponse, error) {
 	change, ok := acp2.ConfigChangeOf(params)
 	if !ok || change.Custom != nil {
-		return nil, fmt.Errorf("invalid params: unsupported config option request")
+		return nil, acp.InvalidParams("unsupported config option request")
 	}
 	handle, err := f.reg.Get(string(change.SessionID))
 	if err != nil {
@@ -127,7 +151,7 @@ func (f *Facade) SetSessionConfigOption(ctx context.Context, params *acp2.SetSes
 	}
 	opts, err := handle.SetConfigOption(ctx, string(change.ConfigID), value)
 	if err != nil {
-		return nil, err
+		return nil, backendError(err, "")
 	}
 	return &acp2.SetSessionConfigOptionResponse{ConfigOptions: opts}, nil
 }
@@ -143,14 +167,14 @@ func (f *Facade) ListSessions(ctx context.Context, params *acp2.ListSessionsRequ
 	if params.Cwd != nil && *params.Cwd != "" {
 		cwd := string(*params.Cwd)
 		if !filepath.IsAbs(cwd) {
-			return nil, fmt.Errorf("invalid params: cwd %q must be an absolute path", cwd)
+			return nil, acp.InvalidParams(fmt.Sprintf("cwd %q must be an absolute path", cwd))
 		}
 		filter.Cwd = cwd
 	}
 	if params.Cursor != nil {
 		offset, ok := parseOffsetCursor(string(*params.Cursor))
 		if !ok {
-			return nil, fmt.Errorf("invalid params: unknown session/list cursor: %s", *params.Cursor)
+			return nil, acp.InvalidParams(fmt.Sprintf("unknown session/list cursor: %s", *params.Cursor))
 		}
 		filter.Offset = offset
 	}
@@ -207,11 +231,12 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 	if _, err := f.reg.Get(id); err != nil {
 		cwd := string(params.Cwd)
 		if cwd != "" && !cwdAllowed(cwd, f.allowDirs) {
-			return nil, fmt.Errorf("invalid params: cwd %q is not under an allowed root", cwd)
+			return nil, acp.InvalidParams(fmt.Sprintf("cwd %q is not under an allowed root", cwd))
 		}
 		handle, err := f.be.ResumeSession(ctx, id, backend.ResumeParams{Cwd: cwd})
 		if err != nil {
-			return nil, fmt.Errorf("resume session: %w", err)
+			log.Printf("session %s: resume rejected: cwd=%s: %v", id, cwd, err)
+			return nil, backendError(err, "resume session")
 		}
 		f.reg.Register(id, f.name, handle)
 	}
@@ -225,7 +250,7 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 		case schema.ReplayFromCustom:
 			seq, ok := parseHarnessSeq(v)
 			if !ok {
-				return nil, fmt.Errorf("invalid params: unrecognised replayFrom cursor %q", v.Type)
+				return nil, acp.InvalidParams(fmt.Sprintf("unrecognised replayFrom cursor %q", v.Type))
 			}
 			afterSeq = &seq
 		}
@@ -234,7 +259,7 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 	replay, state, start, err := f.attach(id, afterSeq)
 	if err != nil {
 		if errors.Is(err, session.ErrReplayGap) {
-			return nil, fmt.Errorf("invalid params: %w", err)
+			return nil, acp.InvalidParams(err.Error())
 		}
 		return nil, err
 	}
@@ -336,6 +361,22 @@ func (f *Facade) CloseSession(ctx context.Context, params *acp2.CloseSessionRequ
 	f.detach(id)
 	_ = f.reg.Remove(ctx, id)
 	return &acp2.CloseSessionResponse{}, nil
+}
+
+// DeleteSession removes a session and its stored history. An active session is
+// stopped first, so nothing keeps writing what is being deleted; a session
+// that is not there is not an error, as the protocol asks.
+func (f *Facade) DeleteSession(ctx context.Context, params *acp2.DeleteSessionRequest) (*acp2.DeleteSessionResponse, error) {
+	id := string(params.SessionID)
+	f.detach(id)
+	if err := f.reg.Remove(ctx, id); err != nil {
+		return nil, backendError(err, "delete session "+id)
+	}
+	if err := f.be.DeleteSession(ctx, id); err != nil {
+		log.Printf("session %s: delete rejected: %v", id, err)
+		return nil, backendError(err, "delete session "+id)
+	}
+	return &acp2.DeleteSessionResponse{}, nil
 }
 
 // CancelSession interrupts the running turn. The turn's end is still reported
@@ -478,13 +519,15 @@ func (f *Facade) Prompt(ctx context.Context, params *acp2.PromptRequest) (*acp2.
 	id := string(params.SessionID)
 	handle, err := f.reg.Get(id)
 	if err != nil {
-		return nil, fmt.Errorf("session %s not found", id)
+		return nil, acp.SessionNotFound(id)
 	}
 	f.mu.Lock()
 	_, attached := f.attached[id]
 	f.mu.Unlock()
 	if !attached {
-		return nil, fmt.Errorf("session %s is not active on this connection: send session/resume first", id)
+		return nil, acp.ResourceNotFound(
+			fmt.Sprintf("session %s is not active on this connection: send session/resume first", id),
+		).WithData(map[string]string{"sessionId": id})
 	}
 	msgID, err := handle.Send(ctx, params.Prompt)
 	if err != nil {

@@ -14,11 +14,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/coxlong/harness-acp/internal/backend"
 )
 
 // RuntimeConfig controls per-runtime limits.
@@ -155,6 +158,16 @@ func (r *Runtime) Get(sessionUUID string) *proc {
 
 // spawn starts the process. Must be called with r.mu held.
 func (r *Runtime) spawn(sessionUUID string, o SpawnOpts) (*proc, error) {
+	// A missing cwd would fail exec with a misleading "fork/exec <binary>:
+	// no such file or directory" that blames the binary. Say what is actually
+	// wrong, as an invalid parameter, before anything is started.
+	if o.Cwd != "" {
+		if info, err := os.Stat(o.Cwd); err != nil {
+			return nil, &backend.CwdNotExistError{Path: o.Cwd}
+		} else if !info.IsDir() {
+			return nil, backend.InvalidParams("working directory %q is not a directory", o.Cwd)
+		}
+	}
 	ctx, cancel := context.WithCancel(r.ctx)
 
 	args := []string{

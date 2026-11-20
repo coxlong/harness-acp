@@ -2,10 +2,39 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/ironpark/acp-go/acp2"
 )
+
+// InvalidParamsError marks a client-input problem: a parameter value the
+// backend cannot honour. The ACP facade reports it as JSON-RPC -32602
+// (Invalid params), as the protocol assigns malformed and unsupported values.
+type InvalidParamsError struct{ Detail string }
+
+func (e *InvalidParamsError) Error() string { return e.Detail }
+
+// InvalidParams builds an InvalidParamsError, printf-style.
+func InvalidParams(format string, a ...any) error {
+	return &InvalidParamsError{Detail: fmt.Sprintf(format, a...)}
+}
+
+// SessionNotFoundError marks a session the backend does not have. The facade
+// reports it as -32002 (Resource not found) with data.sessionId, which the
+// protocol requires for session/resume of a session that does not exist.
+type SessionNotFoundError struct{ ID string }
+
+func (e *SessionNotFoundError) Error() string { return "session " + e.ID + " not found" }
+
+// CwdNotExistError marks a working directory that is gone on this machine.
+// The parameter cannot be honoured, so the facade reports it as -32602 with
+// a message that names the directory, instead of a spawn failure.
+type CwdNotExistError struct{ Path string }
+
+func (e *CwdNotExistError) Error() string {
+	return "working directory " + e.Path + " no longer exists"
+}
 
 // AgentInfo describes a backend agent.
 type AgentInfo struct {
@@ -154,6 +183,10 @@ type Backend interface {
 	Options(ctx context.Context, cwd string, additionalDirs []string) (Options, error)
 	NewSession(ctx context.Context, p NewSessionParams) (SessionHandle, error)
 	ResumeSession(ctx context.Context, id string, p ResumeParams) (SessionHandle, error)
+	// DeleteSession removes a session and its stored history. A session that
+	// is not there is not an error: the caller's goal is that it is gone.
+	// An id the backend cannot accept is an InvalidParamsError.
+	DeleteSession(ctx context.Context, id string) error
 	Close() error
 }
 

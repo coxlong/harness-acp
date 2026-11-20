@@ -313,6 +313,26 @@ func TestE2E_PromptWithoutResumeRefused(t *testing.T) {
 	}
 }
 
+// offeredSelect reports whether the select option id lists value.
+func offeredSelect(opts []acp2.SessionConfigOption, id, value string) bool {
+	for _, o := range opts {
+		sel, ok := o.As[schema.SessionConfigOptionSelect]()
+		if !ok || string(sel.ConfigID) != id {
+			continue
+		}
+		list, err := sel.Options.As[[]schema.SessionConfigSelectOption]()
+		if err != nil {
+			return false
+		}
+		for _, v := range list {
+			if string(v.Value) == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func selectValue(opts []acp2.SessionConfigOption, id string) (string, bool) {
 	for _, o := range opts {
 		if sel, ok := o.As[schema.SessionConfigOptionSelect](); ok && string(sel.ConfigID) == id {
@@ -358,8 +378,14 @@ func TestE2E_ConfigOptions(t *testing.T) {
 		t.Errorf("no config_option_update: %v", rec.snapshot())
 	}
 
-	// Auto and bypass are in the catalog, and the process accepts both.
+	// Auto and bypass are in the catalog, and the process accepts both. Running
+	// as root, Claude Code refuses bypassPermissions, so only the modes this CLI
+	// offers are required to be settable.
 	for _, m := range []string{"auto", "bypassPermissions", "default"} {
+		if !offeredSelect(ns.ConfigOptions, "mode", m) {
+			t.Logf("mode %q is not offered by this CLI; not required", m)
+			continue
+		}
 		r := acp2.NewSetSessionConfigOptionRequest(schema.SetSessionConfigOptionRequestID{
 			SessionID: ns.SessionID, ConfigID: "mode", Value: schema.SessionConfigValueID(m),
 		})
@@ -380,7 +406,14 @@ func TestE2E_ConfigOptions(t *testing.T) {
 	}
 
 	// A model change is applied by the process, and effort follows the model.
+	// The catalog is the CLI's: a gateway may not offer these values at all, so
+	// only an offered value is required to be settable.
+	beforeModel, _ := selectValue(ns.ConfigOptions, "model")
 	for _, step := range []struct{ id, value string }{{"model", "sonnet"}, {"effort", "low"}} {
+		if !offeredSelect(ns.ConfigOptions, step.id, step.value) {
+			t.Logf("%s %q is not offered by this CLI; not required", step.id, step.value)
+			continue
+		}
 		r := acp2.NewSetSessionConfigOptionRequest(schema.SetSessionConfigOptionRequestID{
 			SessionID: ns.SessionID, ConfigID: schema.SessionConfigID(step.id), Value: schema.SessionConfigValueID(step.value),
 		})
@@ -390,6 +423,16 @@ func TestE2E_ConfigOptions(t *testing.T) {
 		}
 		if v, _ := selectValue(resp.ConfigOptions, step.id); v != step.value {
 			t.Errorf("%s after set = %q, want %q", step.id, v, step.value)
+		}
+	}
+	// Put the catalog back: the gateway's model names are not Claude's, and a
+	// session left on a model the CLI cannot resolve never answers.
+	if v, _ := selectValue(ns.ConfigOptions, "model"); v != beforeModel && beforeModel != "" {
+		r := acp2.NewSetSessionConfigOptionRequest(schema.SetSessionConfigOptionRequestID{
+			SessionID: ns.SessionID, ConfigID: "model", Value: schema.SessionConfigValueID(beforeModel),
+		})
+		if _, err := client.SetSessionConfigOption(ctx, &r); err != nil {
+			t.Logf("restoring model %q: %v", beforeModel, err)
 		}
 	}
 
@@ -402,9 +445,15 @@ func TestE2E_ConfigOptions(t *testing.T) {
 		t.Errorf("session/options mode = %q", v)
 	}
 
-	// Plan mode reaches Claude Code: a Write is not asked about, it is planned.
+	// A session still answers after its options changed. A fresh session, because
+	// options belong to the session and a gateway's catalog may leave the first
+	// one on a model the CLI cannot resolve.
 	rec.reset()
-	if _, err := client.Prompt(ctx, prompt(ns.SessionID, "reply with exactly: pong")); err != nil {
+	ns2, err := client.NewSession(ctx, &acp2.NewSessionRequest{Cwd: schema.AbsolutePath(s.dir)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Prompt(ctx, prompt(ns2.SessionID, "reply with exactly: pong")); err != nil {
 		t.Fatal(err)
 	}
 	rec.waitIdles(t, 1)
