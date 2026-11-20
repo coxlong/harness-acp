@@ -409,7 +409,7 @@ func (t *translator) toolResults(l *line) []backend.Event {
 		} else if isSendMessage(info.name) {
 			out = append(out, t.sendMessageResult(b, l)...)
 		} else if planTool(info.name) {
-			if !b.IsError && t.applyTaskResult(info.name, info.input, l.ToolUseResult, resultText(b.Content)) {
+			if !b.IsError && applyTaskResult(&t.checklist, info.name, info.input, l.ToolUseResult, resultText(b.Content)) {
 				out = append(out, planUpdate(t.checklist.planEntries()))
 			}
 		} else {

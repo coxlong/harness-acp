@@ -389,8 +389,9 @@ var (
 
 // applyTaskResult updates the task list from a finished Task* tool call and
 // reports whether the list changed. input is the call's input; text the
-// result's text.
-func (t *translator) applyTaskResult(name string, input json.RawMessage, structured json.RawMessage, text string) bool {
+// result's text. The live stream and the replay of a transcript both read the
+// list through it, so a resumed session shows the plan it ended with.
+func applyTaskResult(l *taskList, name string, input json.RawMessage, structured json.RawMessage, text string) bool {
 	switch name {
 	case "TaskCreate":
 		var in struct{ Subject, ActiveForm string }
@@ -416,7 +417,7 @@ func (t *translator) applyTaskResult(name string, input json.RawMessage, structu
 		if id == "" {
 			return false
 		}
-		t.checklist.set(id, taskEntry{subject: subject, status: "pending", activeForm: in.ActiveForm})
+		l.set(id, taskEntry{subject: subject, status: "pending", activeForm: in.ActiveForm})
 		return true
 	case "TaskUpdate":
 		var in struct {
@@ -429,11 +430,11 @@ func (t *translator) applyTaskResult(name string, input json.RawMessage, structu
 			return false
 		}
 		if in.Status == "deleted" {
-			t.checklist.remove(in.TaskID)
+			l.remove(in.TaskID)
 			return true
 		}
 		e := taskEntry{}
-		if old := t.checklist.entries[in.TaskID]; old != nil {
+		if old := l.entries[in.TaskID]; old != nil {
 			e = *old
 		}
 		if in.Subject != "" {
@@ -451,11 +452,11 @@ func (t *translator) applyTaskResult(name string, input json.RawMessage, structu
 		if e.status == "" {
 			e.status = "pending"
 		}
-		t.checklist.set(in.TaskID, e)
+		l.set(in.TaskID, e)
 		return true
 	case "TaskList":
 		text = strings.TrimSpace(text)
-		prev := t.checklist.entries
+		prev := l.entries
 		var fresh taskList
 		if text != "No tasks found" {
 			for _, ln := range strings.Split(text, "\n") {
@@ -470,7 +471,7 @@ func (t *translator) applyTaskResult(name string, input json.RawMessage, structu
 				fresh.set(m[1], e)
 			}
 		}
-		t.checklist = fresh
+		*l = fresh
 		return true
 	}
 	return false
