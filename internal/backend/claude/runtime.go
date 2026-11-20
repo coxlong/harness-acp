@@ -38,6 +38,8 @@ type SpawnOpts struct {
 	AddDirs  []string
 	New      bool // true: --session-id (fresh); false: --resume
 	Model    string
+	Mode     string // permission mode; "" for Claude Code's default
+	Effort   string // effort level; "" for Claude Code's default
 	SystemPr string
 }
 
@@ -162,6 +164,7 @@ func (r *Runtime) spawn(sessionUUID string, o SpawnOpts) (*proc, error) {
 		"--output-format", "stream-json",
 		"--include-partial-messages",
 		"--permission-prompt-tool=stdio", // can_use_tool arrives as control_request
+		"--forward-subagent-text",        // a subagent's text arrives with parent_tool_use_id
 	}
 	if o.New {
 		args = append(args, "--session-id", sessionUUID)
@@ -173,6 +176,16 @@ func (r *Runtime) spawn(sessionUUID string, o SpawnOpts) (*proc, error) {
 	}
 	if o.Model != "" {
 		args = append(args, "--model", o.Model)
+	}
+	if bypassAllowed {
+		// Lets the session switch to bypassPermissions later; it does not start in it.
+		args = append(args, "--allow-dangerously-skip-permissions")
+	}
+	if o.Mode != "" {
+		args = append(args, "--permission-mode", o.Mode)
+	}
+	if o.Effort != "" {
+		args = append(args, "--effort", o.Effort)
 	}
 	if o.SystemPr != "" {
 		args = append(args, "--append-system-prompt", o.SystemPr)

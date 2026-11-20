@@ -36,7 +36,16 @@ type Session struct {
 	foreground bool // a turn is open
 	cancelling bool // session/cancel hit the open turn; its idle reports cancelled
 	pending    map[string]pendingPerm
+	info       *initInfo          // what Claude Code offers; set by Init
+	tailers    map[string]*tailer // by terminal id
+	bgKey      string             // the background work last reported, as JSON
+	titled     bool               // a session title went out
+	titling    bool               // a title request is out
 	reqSeq     atomic.Uint64
+
+	// ctl holds the control requests that wait for an answer.
+	ctlMu sync.Mutex
+	ctl   map[string]chan ctlReply
 
 	// closeMu guards closed/events so Close can close the channel safely.
 	closeMu sync.RWMutex
@@ -48,16 +57,19 @@ type Session struct {
 type pendingPerm struct {
 	p     *proc
 	input map[string]any
+	child string // the subagent session the request belongs to
 }
 
 // NewSession wraps a session uuid. The process is spawned on first Send.
 func NewSession(uuid string, rt *Runtime, opts SpawnOpts) *Session {
+	tr := newTranslator()
+	tr.sessionID, tr.cwd = uuid, opts.Cwd
 	return &Session{
 		uuid:    uuid,
 		rt:      rt,
 		opts:    opts,
 		events:  make(chan backend.Event, 256),
-		tr:      newTranslator(),
+		tr:      tr,
 		pending: make(map[string]pendingPerm),
 		done:    make(chan struct{}),
 	}
@@ -84,7 +96,7 @@ func (s *Session) send(ev backend.Event) {
 
 func (s *Session) turn(state backend.TurnState, reason acp2.StopReason, err error) {
 	s.send(backend.Event{Kind: backend.EventTurnState, Turn: backend.TurnEvent{
-		State: state, StopReason: reason, Err: err,
+		State: state, StopReason: reason, Err: err, Background: s.tr.backgroundWork(),
 	}})
 }
 
@@ -102,6 +114,9 @@ func (s *Session) Send(ctx context.Context, blocks []acp2.ContentBlock) (acp2.Me
 	if err != nil {
 		return "", err
 	}
+	s.mu.Lock()
+	s.opts.New = false // the first prompt creates the transcript: later starts resume it
+	s.mu.Unlock()
 
 	// Reported before the write: Claude Code's output can follow the write at
 	// once, and the client must see the prompt before the work it starts.
@@ -118,6 +133,10 @@ func (s *Session) Send(ctx context.Context, blocks []acp2.ContentBlock) (acp2.Me
 		s.turn(backend.TurnRunning, "", nil)
 	}
 	s.mu.Unlock()
+
+	if startTurn {
+		s.askTitle(p, blocks)
+	}
 
 	// The write is outside mu on purpose: a large prompt (a base64 image)
 	// can exceed the pipe buffer, and then it waits for Claude Code to read
@@ -150,9 +169,6 @@ func (s *Session) ensureProc() (*proc, error) {
 		return nil, err
 	}
 	if fresh {
-		s.mu.Lock()
-		s.opts.New = false
-		s.mu.Unlock()
 		go s.readLoop(p)
 	}
 	return p, nil
@@ -226,6 +242,7 @@ func (s *Session) Respond(reqID string, d backend.Decision) error {
 	if len(s.pending) == 0 && s.foreground && !s.cancelling {
 		s.turn(backend.TurnRunning, "", nil)
 	}
+	s.syncBlockedChildren()
 	return werr
 }
 
@@ -269,6 +286,7 @@ func (s *Session) handle(p *proc, raw []byte) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.afterLine()
 
 	switch l.Type {
 	case "stream_event", "assistant":
@@ -280,12 +298,18 @@ func (s *Session) handle(p *proc, raw []byte) {
 		for _, ev := range s.tr.content(&l) {
 			s.send(ev)
 		}
+	case "control_response":
+		s.controlReply(raw)
 	case "control_request":
 		s.permissionRequested(p, &l)
 	case "control_cancel_request":
 		// Claude Code withdrew a request (the turn was interrupted, or a hook
 		// answered it): stop waiting for the user.
 		s.permissionWithdrawn(l.RequestID)
+	case "system":
+		for _, ev := range s.tr.system(&l) {
+			s.send(ev)
+		}
 	case "result":
 		s.result(p, raw)
 	}
@@ -301,6 +325,7 @@ func (s *Session) outputStarts(p *proc, l *line) {
 	s.foreground = true
 	s.cancelling = false
 	s.tr.agentText = false
+	s.tr.errKind, s.tr.errText = "", ""
 	p.busy.Store(true)
 	s.turn(backend.TurnRunning, "", nil)
 }
@@ -312,11 +337,16 @@ func (s *Session) permissionRequested(p *proc, l *line) {
 	}
 	var req permissionRequest
 	_ = json.Unmarshal(l.Request, &req)
-	s.pending[ev.Permission.ReqID] = pendingPerm{p: p, input: req.Input}
+	s.pending[ev.Permission.ReqID] = pendingPerm{p: p, input: req.Input, child: ev.Permission.Session}
 
 	// Work blocked on the user is requires_action, whether or not a turn is open.
 	if s.foreground {
 		s.turn(backend.TurnRequiresAction, "", nil)
+	}
+	s.syncBlockedChildren()
+	// A held SendMessage call that asks is shown: the client cannot be asked about a call it does not know.
+	for _, shown := range s.tr.reveal(ev.Permission.ToolCallID) {
+		s.send(shown)
 	}
 	s.send(ev)
 }
@@ -330,6 +360,7 @@ func (s *Session) permissionWithdrawn(reqID string) {
 	if len(s.pending) == 0 && s.foreground && !s.cancelling {
 		s.turn(backend.TurnRunning, "", nil)
 	}
+	s.syncBlockedChildren()
 }
 
 // result ends the open turn.
@@ -339,6 +370,11 @@ func (s *Session) result(p *proc, raw []byte) {
 		return
 	}
 	reason, err := r.end(s.cancelling)
+	if err != nil {
+		// A failed request left its own text and error kind in a synthetic message.
+		text := firstNonEmpty(s.tr.errText, err.Error())
+		err = failure(text, s.tr.errKind, r.Subtype)
+	}
 
 	// A local command (such as /context) answers with its result alone: no
 	// model text streamed for it. Show that result as an agent message.
@@ -348,10 +384,19 @@ func (s *Session) result(p *proc, raw []byte) {
 		s.send(agentChunkEv(id, r.Result))
 	}
 
+	// A compaction the turn leaves open ended with it; the usage is the turn's.
+	for _, ev := range s.tr.compactionCancel() {
+		s.send(ev)
+	}
+	if ev, ok := s.tr.usage.result(&r); ok {
+		s.send(ev)
+	}
+
 	// A permission request that is still open can no longer be answered.
 	for id := range s.pending {
 		delete(s.pending, id)
 	}
+	s.syncBlockedChildren()
 	if !s.foreground {
 		// A turn that sent nothing before its result: open and close it, so
 		// the client still sees the work that ended.
@@ -370,6 +415,16 @@ func (s *Session) result(p *proc, raw []byte) {
 func (s *Session) procExited(p *proc, scanErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The process's background work ended with it, after the turn's own end.
+	defer func() {
+		if cur := s.rt.Get(s.uuid); cur != nil && cur != p {
+			return // a newer process runs the session's work now
+		}
+		for _, ev := range s.tr.processEnded() {
+			s.send(ev)
+		}
+		s.afterLine()
+	}()
 	for id, pp := range s.pending {
 		if pp.p == p {
 			delete(s.pending, id)

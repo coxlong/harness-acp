@@ -2,6 +2,8 @@ package backend
 
 import (
 	"context"
+	"time"
+
 	"github.com/ironpark/acp-go/acp2"
 )
 
@@ -13,9 +15,11 @@ type AgentInfo struct {
 	Available   bool
 }
 
-// ListFilter filters session list results.
+// ListFilter selects one page of session list results.
 type ListFilter struct {
-	Cwd string
+	Cwd    string // only sessions of exactly this directory; empty for all
+	Offset int    // sessions to skip, newest first
+	Limit  int    // page size; 0 for no limit
 }
 
 // NewSessionParams carries session/new parameters.
@@ -34,9 +38,44 @@ type ResumeParams struct {
 
 // SessionInfo describes a session for listing.
 type SessionInfo struct {
-	ID    string
-	Cwd   string
-	Title string
+	ID        string
+	Cwd       string
+	Title     string
+	UpdatedAt time.Time // last activity
+}
+
+// Options is what a client can configure and invoke in a session: config
+// options (mode, model, effort, ...) and slash commands.
+type Options struct {
+	Config   []acp2.SessionConfigOption
+	Commands []acp2.AvailableCommand
+}
+
+// HistoryUpdate is one replayed update: of the session itself, or of a child
+// session (a subagent's) when Session names it.
+type HistoryUpdate struct {
+	Session string
+	Update  acp2.SessionUpdate
+}
+
+// ReplayedChild is a subagent whose history was replayed.
+type ReplayedChild struct {
+	ID     string // its session
+	Parent string // the session that launched it; "" for the replayed session itself
+	// End is how its work ended: an idle state with a stop reason or an error,
+	// or with neither when the history does not say.
+	End TurnEvent
+}
+
+// History is a session's replay: its updates in order, with those of its
+// subagents' child sessions among them, each after the call that launched the
+// subagent.
+type History struct {
+	Updates []HistoryUpdate
+	// Children are the subagents the replay announced, in announcement order.
+	Children []ReplayedChild
+	// Missing counts the subagents whose history could not be restored.
+	Missing int
 }
 
 // EventKind labels events coming from a SessionHandle.
@@ -66,11 +105,15 @@ type TurnEvent struct {
 	State      TurnState
 	StopReason acp2.StopReason
 	Err        error
+	// Background is the complete set of work running apart from the foreground
+	// turn. nil means the backend is not reporting it; empty means none runs.
+	Background []acp2.BackgroundWork
 }
 
 // PermissionRequest is a pending tool-use authorisation.
 type PermissionRequest struct {
 	ReqID      string
+	Session    string // the child session (a subagent's) that asks; "" for the session itself
 	ToolCallID string // the tool call this request is about
 	Title      string
 	ToolName   string
@@ -87,6 +130,9 @@ type Decision struct {
 
 // Event is one item from SessionHandle.Events().
 type Event struct {
+	// Session is the child session (a subagent's) the event belongs to; empty
+	// for the session itself.
+	Session    string
 	Kind       EventKind
 	Update     acp2.SessionUpdate // Kind == EventUpdate
 	Turn       TurnEvent          // Kind == EventTurnState
@@ -98,10 +144,14 @@ type Event struct {
 type Backend interface {
 	Name() string
 	Probe(ctx context.Context) (AgentInfo, error)
-	ListSessions(ctx context.Context, f ListFilter) ([]SessionInfo, string, error)
+	// ListSessions returns one page, newest first, and whether more follow it.
+	ListSessions(ctx context.Context, f ListFilter) (sessions []SessionInfo, more bool, err error)
 	// History returns entity-level snapshots for replayFrom:start.
 	// Each update is already a complete entity state, not a raw delta.
-	History(ctx context.Context, id string) ([]acp2.SessionUpdate, error)
+	History(ctx context.Context, id string) (History, error)
+	// Options reports what a session started in cwd could be configured with,
+	// without creating one.
+	Options(ctx context.Context, cwd string, additionalDirs []string) (Options, error)
 	NewSession(ctx context.Context, p NewSessionParams) (SessionHandle, error)
 	ResumeSession(ctx context.Context, id string, p ResumeParams) (SessionHandle, error)
 	Close() error
@@ -118,6 +168,12 @@ type SessionHandle interface {
 	Events() <-chan Event
 	// Respond answers a pending permission request.
 	Respond(reqID string, d Decision) error
+	// Options returns the session's current options.
+	Options() Options
+	// SetConfigOption changes one option and returns all of them. value is a
+	// string for a select option and a bool for a boolean one. A change is also
+	// reported to subscribers as a config_option_update.
+	SetConfigOption(ctx context.Context, id string, value any) ([]acp2.SessionConfigOption, error)
 	Cancel(ctx context.Context) error
 	Close(ctx context.Context) error
 }

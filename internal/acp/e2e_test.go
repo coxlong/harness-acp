@@ -54,6 +54,8 @@ func (r *recorder) SessionUpdate(_ context.Context, n *acp2.UpdateSessionNotific
 	case schema.SessionUpdateReplayComplete:
 		label = "replay_complete"
 		r.replayed = true
+	case schema.SessionUpdateConfigOptionUpdate:
+		label = "config_options"
 	case schema.SessionUpdateStateUpdate:
 		switch s := v.Value.Variant().(type) {
 		case schema.StateUpdateRunning:
@@ -309,4 +311,101 @@ func TestE2E_PromptWithoutResumeRefused(t *testing.T) {
 	if _, err := c2.Prompt(ctx, prompt(ns.SessionID, "hi")); err == nil {
 		t.Error("prompt on an unattached connection should fail")
 	}
+}
+
+func selectValue(opts []acp2.SessionConfigOption, id string) (string, bool) {
+	for _, o := range opts {
+		if sel, ok := o.As[schema.SessionConfigOptionSelect](); ok && string(sel.ConfigID) == id {
+			return string(sel.CurrentValue), true
+		}
+	}
+	return "", false
+}
+
+// A new session reports its options; changing one answers with all of them and
+// tells the connection, and the change reaches the real process.
+func TestE2E_ConfigOptions(t *testing.T) {
+	s := newStack(t)
+	client, rec := s.connect(t)
+	ctx := context.Background()
+
+	ns, err := client.NewSession(ctx, &acp2.NewSessionRequest{Cwd: schema.AbsolutePath(s.dir)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := selectValue(ns.ConfigOptions, "mode"); !ok || v != "default" {
+		t.Errorf("mode = %q %v", v, ok)
+	}
+	if _, ok := selectValue(ns.ConfigOptions, "model"); !ok {
+		t.Error("no model option")
+	}
+	if len(ns.AvailableCommands) == 0 {
+		t.Error("no commands")
+	}
+
+	req := acp2.NewSetSessionConfigOptionRequest(schema.SetSessionConfigOptionRequestID{
+		SessionID: ns.SessionID, ConfigID: "mode", Value: "plan",
+	})
+	resp, err := client.SetSessionConfigOption(ctx, &req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := selectValue(resp.ConfigOptions, "mode"); v != "plan" {
+		t.Errorf("mode after set = %q", v)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if !has(rec.snapshot(), "config_options") {
+		t.Errorf("no config_option_update: %v", rec.snapshot())
+	}
+
+	// Auto and bypass are in the catalog, and the process accepts both.
+	for _, m := range []string{"auto", "bypassPermissions", "default"} {
+		r := acp2.NewSetSessionConfigOptionRequest(schema.SetSessionConfigOptionRequestID{
+			SessionID: ns.SessionID, ConfigID: "mode", Value: schema.SessionConfigValueID(m),
+		})
+		resp, err := client.SetSessionConfigOption(ctx, &r)
+		if err != nil {
+			t.Fatalf("set mode %s: %v", m, err)
+		}
+		if v, _ := selectValue(resp.ConfigOptions, "mode"); v != m {
+			t.Errorf("mode after set = %q, want %s", v, m)
+		}
+	}
+
+	bad := acp2.NewSetSessionConfigOptionRequest(schema.SetSessionConfigOptionRequestID{
+		SessionID: ns.SessionID, ConfigID: "mode", Value: "nonsense",
+	})
+	if _, err := client.SetSessionConfigOption(ctx, &bad); err == nil {
+		t.Error("an unknown mode value was accepted")
+	}
+
+	// A model change is applied by the process, and effort follows the model.
+	for _, step := range []struct{ id, value string }{{"model", "sonnet"}, {"effort", "low"}} {
+		r := acp2.NewSetSessionConfigOptionRequest(schema.SetSessionConfigOptionRequestID{
+			SessionID: ns.SessionID, ConfigID: schema.SessionConfigID(step.id), Value: schema.SessionConfigValueID(step.value),
+		})
+		resp, err := client.SetSessionConfigOption(ctx, &r)
+		if err != nil {
+			t.Fatalf("set %s=%s: %v", step.id, step.value, err)
+		}
+		if v, _ := selectValue(resp.ConfigOptions, step.id); v != step.value {
+			t.Errorf("%s after set = %q, want %q", step.id, v, step.value)
+		}
+	}
+
+	// Options of a directory, without a session.
+	o, err := client.GetSessionOptions(ctx, &acp2.SessionOptionsRequest{Cwd: schema.AbsolutePath(s.dir)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := selectValue(o.ConfigOptions, "mode"); v != "default" {
+		t.Errorf("session/options mode = %q", v)
+	}
+
+	// Plan mode reaches Claude Code: a Write is not asked about, it is planned.
+	rec.reset()
+	if _, err := client.Prompt(ctx, prompt(ns.SessionID, "reply with exactly: pong")); err != nil {
+		t.Fatal(err)
+	}
+	rec.waitIdles(t, 1)
 }

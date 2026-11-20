@@ -31,9 +31,9 @@ type entry struct {
 	subs   map[uint64]chan backend.Event
 	subSeq uint64
 
-	// state is the session's latest foreground state, for the snapshot a
-	// resuming connection gets. The zero value is idle.
-	state backend.TurnState
+	// state is the session's latest foreground state with its background work,
+	// for the snapshot a resuming connection gets. The zero value is idle.
+	state backend.TurnEvent
 
 	// single-turn mutex: for claude one-process-at-a-time
 	turnMu sync.Mutex
@@ -84,8 +84,10 @@ func (r *Registry) Register(id, agentName string, h backend.SessionHandle) {
 func (r *Registry) pump(id string, e *entry) {
 	for ev := range e.handle.Events() {
 		e.mu.Lock()
-		if ev.Kind == backend.EventTurnState {
-			e.state = ev.Turn.State
+		if ev.Kind == backend.EventTurnState && ev.Session == "" {
+			// A snapshot is not a completion: it keeps the state and the
+			// background work, and no stop reason or error.
+			e.state = backend.TurnEvent{State: ev.Turn.State, Background: ev.Turn.Background}
 		}
 		seq := e.bufSeq
 		e.bufSeq++
@@ -156,10 +158,10 @@ func (r *Registry) Replay(id string, afterSeq uint64) ([]backend.Event, error) {
 // later ones as one step, so no event is lost or delivered twice between the
 // replay and the live stream. If afterSeq is nil there is no replay. It also
 // returns the session's current foreground state.
-func (r *Registry) SubscribeReplay(id string, afterSeq *uint64) ([]backend.Event, backend.TurnState, <-chan backend.Event, func(), error) {
+func (r *Registry) SubscribeReplay(id string, afterSeq *uint64) ([]backend.Event, backend.TurnEvent, <-chan backend.Event, func(), error) {
 	e := r.entry(id)
 	if e == nil {
-		return nil, backend.TurnIdle, nil, nil, ErrSessionNotFound
+		return nil, backend.TurnEvent{}, nil, nil, ErrSessionNotFound
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -167,7 +169,7 @@ func (r *Registry) SubscribeReplay(id string, afterSeq *uint64) ([]backend.Event
 	if afterSeq != nil {
 		var err error
 		if replay, err = e.replayLocked(*afterSeq); err != nil {
-			return nil, backend.TurnIdle, nil, nil, err
+			return nil, backend.TurnEvent{}, nil, nil, err
 		}
 	}
 	ch, unsub := e.subscribeLocked()
