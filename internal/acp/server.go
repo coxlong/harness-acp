@@ -15,6 +15,7 @@ import (
 	"github.com/coxlong/harness-acp/internal/config"
 	"github.com/coxlong/harness-acp/internal/registry"
 	"github.com/coxlong/harness-acp/internal/session"
+	"github.com/coxlong/harness-acp/internal/version"
 )
 
 // Server wires the HTTP mux together.
@@ -93,7 +94,9 @@ func (s *Server) wsOrigins() []string {
 	return []string{"*"}
 }
 
-// discoveryResponse is the payload for GET /v1/agents.
+// discoveryResponse is the payload for GET /v1/agents. A client reads it
+// before it has an ACP connection, so it carries everything needed to pick an
+// endpoint: the daemon version, the ACP revision it speaks, and the agents.
 type discoveryResponse struct {
 	HarnessdVersion string               `json:"harnessdVersion"`
 	ACPVersion      int                  `json:"acpVersion"`
@@ -103,9 +106,12 @@ type discoveryResponse struct {
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	agents := s.agentReg.List()
 	w.Header().Set("Content-Type", "application/json")
+	// A stale agent list would be worse than none: it names endpoints that may
+	// no longer exist.
+	w.Header().Set("Cache-Control", "no-store")
 	if err := json.NewEncoder(w).Encode(discoveryResponse{
-		HarnessdVersion: "0.1.0",
-		ACPVersion:      2,
+		HarnessdVersion: version.Version,
+		ACPVersion:      acp2.ProtocolVersion,
 		Agents:          agents,
 	}); err != nil {
 		log.Printf("discovery encode error: %v", err)

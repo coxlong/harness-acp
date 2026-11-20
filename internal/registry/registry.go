@@ -4,17 +4,19 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 )
 
-// AgentInfo holds metadata about a discovered agent.
+// AgentInfo holds metadata about a discovered agent. The JSON names are the
+// discovery contract (`GET /v1/agents`) the client reads.
 type AgentInfo struct {
-	Name        string
-	DisplayName string
-	Endpoint    string
-	Available   bool
-	Version     string
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	Endpoint    string `json:"endpoint"`
+	Available   bool   `json:"available"`
+	Version     string `json:"version"`
 }
 
 // Registry stores known agents, protected by a read-write mutex.
@@ -104,7 +106,8 @@ func (r *Registry) Register(info AgentInfo) {
 	r.agents[info.Name] = info
 }
 
-// List returns a snapshot of all registered agents.
+// List returns a snapshot of all registered agents, ordered by name so two
+// discovery calls cannot disagree on order.
 func (r *Registry) List() []AgentInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -112,6 +115,7 @@ func (r *Registry) List() []AgentInfo {
 	for _, info := range r.agents {
 		result = append(result, info)
 	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
 	return result
 }
 
