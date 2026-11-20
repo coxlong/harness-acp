@@ -192,15 +192,6 @@ type replayer struct {
 	handbacks  map[string]*handbackCall
 	targets    map[string]string // the agent a TaskStop or SendMessage call names, by tool use
 	transcript string
-
-	// The plan the session showed: task tools change it as work goes, and a
-	// resumed session must show it again. Only its final state is replayed,
-	// which the protocol allows, because the client replaces the whole plan
-	// with each update anyway.
-	tasks     taskList
-	planCalls map[string]planCall // plan tool calls awaiting their result
-	plan      []schema.PlanEntry
-	planSeen  bool
 }
 
 // planCall is a plan tool call whose result says how the plan changed.
@@ -214,7 +205,6 @@ func newReplayer(root, transcript, cwd string) *replayer {
 		root: root, cwd: cwd, transcript: transcript, metas: loadSubagents(transcript, root),
 		byLaunch: map[string]*replayChild{}, byID: map[string]*replayChild{}, omitted: map[string]bool{},
 		sendByUse: map[string]*sendCall{}, handbacks: map[string]*handbackCall{}, targets: map[string]string{},
-		planCalls: map[string]planCall{},
 	}
 }
 
@@ -582,6 +572,13 @@ type history struct {
 	owner   *replayChild // nil for the replayed session itself
 	open    map[string]bool
 
+	// The plan this session showed. A plan belongs to one session, so a
+	// subagent's tasks never end up in its parent's checklist.
+	tasks taskList
+	calls map[string]planCall // plan tool calls awaiting their result
+	plan  []schema.PlanEntry
+	seen  bool
+
 	// the assistant message being merged
 	curID    string
 	text     []acp2.ContentBlock
@@ -589,7 +586,10 @@ type history struct {
 }
 
 func (r *replayer) newHistory(session string, owner *replayChild) *history {
-	return &history{r: r, session: session, owner: owner, open: map[string]bool{}}
+	return &history{
+		r: r, session: session, owner: owner, open: map[string]bool{},
+		calls: map[string]planCall{},
+	}
 }
 
 func (h *history) emit(u acp2.SessionUpdate) { h.r.emit(h.session, u) }
@@ -612,47 +612,49 @@ func (h *history) run(lines []transcriptLine) {
 			Status:     optional.Of(schema.ToolCallStatusFailed),
 		}))
 	}
-	h.r.emitPlan()
+	h.emitPlan()
 }
 
 // planCall records a plan tool call. TodoWrite carries the whole list, so its
 // result adds nothing; the Task* family reports the change in its result.
-func (r *replayer) planCall(name, use string, input json.RawMessage) {
+func (h *history) planCall(name, use string, input json.RawMessage) {
 	if name == "TodoWrite" {
-		r.plan = todoWritePlan(input)
-		r.planSeen = true
+		h.plan = todoWritePlan(input)
+		h.seen = true
 		return
 	}
-	r.planCalls[use] = planCall{name: name, input: input}
+	h.calls[use] = planCall{name: name, input: input}
 }
 
 // planResult folds a Task* call's result into the task list.
-func (r *replayer) planResult(pc planCall, b block) {
+func (h *history) planResult(pc planCall, b block) {
 	if b.IsError {
 		return
 	}
-	if !applyTaskResult(&r.tasks, pc.name, pc.input, nil, resultText(b.Content)) {
+	if !applyTaskResult(&h.tasks, pc.name, pc.input, nil, resultText(b.Content)) {
 		return
 	}
-	r.plan = r.tasks.planEntries()
-	r.planSeen = true
+	h.plan = h.tasks.planEntries()
+	h.seen = true
 }
 
 // emitPlan replays the plan the session ended with, so a resumed session shows
-// the checklist it had instead of losing it.
-func (r *replayer) emitPlan() {
-	if !r.planSeen {
+// the checklist it had instead of losing it. Only the final state goes out: a
+// client replaces the whole plan on every update, and the protocol allows
+// replaying an entity's current state instead of each of its updates.
+func (h *history) emitPlan() {
+	if !h.seen {
 		return
 	}
-	if len(r.plan) == 0 {
-		emitVariant(r, r.root, schema.SessionUpdatePlanRemoved{PlanID: checklistPlanID})
+	if len(h.plan) == 0 {
+		h.emit(schema.NewSessionUpdate(schema.SessionUpdatePlanRemoved{PlanID: checklistPlanID}))
 		return
 	}
-	emitVariant(r, r.root, schema.SessionUpdatePlanUpdate{
+	h.emit(schema.NewSessionUpdate(schema.SessionUpdatePlanUpdate{
 		Plan: schema.NewPlanUpdateContent(schema.PlanUpdateContentItems{
-			PlanID: checklistPlanID, Entries: r.plan,
+			PlanID: checklistPlanID, Entries: h.plan,
 		}),
-	})
+	}))
 }
 
 // flush emits the merged assistant message, if any.
@@ -718,7 +720,7 @@ func (h *history) assistant(l *transcriptLine) {
 			if planTool(b.Name) {
 				// A plan tool makes the plan, not a tool card: the live session
 				// reports it as plan_update, and so does the replay.
-				h.r.planCall(b.Name, b.ID, b.Input)
+				h.planCall(b.Name, b.ID, b.Input)
 				continue
 			}
 			var input map[string]any
@@ -812,9 +814,9 @@ func (h *history) user(l *transcriptLine) {
 		if b.Type != "tool_result" {
 			continue
 		}
-		if pc, ok := r.planCalls[b.ToolUseID]; ok {
-			delete(r.planCalls, b.ToolUseID)
-			r.planResult(pc, b)
+		if pc, ok := h.calls[b.ToolUseID]; ok {
+			delete(h.calls, b.ToolUseID)
+			h.planResult(pc, b)
 			continue
 		}
 		if c := r.byLaunch[b.ToolUseID]; c != nil && c.announced {

@@ -106,3 +106,46 @@ func TestReplayWithoutPlanSaysNothing(t *testing.T) {
 		}
 	}
 }
+
+// A plan belongs to one session: a subagent that keeps its own checklist must
+// not turn up in the parent's, and each session replays its own.
+func TestReplayPlanStaysWithItsSession(t *testing.T) {
+	sub := []string{
+		usr("su1", `"help"`, true, ""),
+		asst("sm1", "sa1", use("st1", "TaskCreate", `{"subject":"Sub work"}`), true),
+		usr("su2", result("st1", `"Task #1 created successfully: Sub work"`, false), true, ""),
+	}
+	root := []string{
+		usr("u1", `"go"`, false, ""),
+		asst("m1", "a1", use("p1", "TaskCreate", `{"subject":"Parent work"}`), false),
+		usr("u2", result("p1", `"Task #1 created successfully: Parent work"`, false), false, ""),
+		asst("m2", "a2", use("tu1", "Agent", `{"description":"Help","prompt":"help"}`), false),
+		usr("u3", result("tu1", `"done"`, false), false, ""),
+	}
+	transcriptDir(t, "s-scope", root, map[string][]string{"a1sub": sub},
+		map[string]string{"a1sub": `{"agentType":"general-purpose","description":"Help","toolUseId":"tu1","requestShape":"foreground"}`})
+
+	_, h := historyLines(t, "s-scope")
+	plans := 0
+	for _, u := range h.Updates {
+		p, ok := u.Update.Variant().(schema.SessionUpdatePlanUpdate)
+		if !ok {
+			continue
+		}
+		plans++
+		items, _ := p.Plan.As[schema.PlanUpdateContentItems]()
+		if len(items.Entries) != 1 {
+			t.Fatalf("entries = %d, want 1", len(items.Entries))
+		}
+		want := "Parent work"
+		if u.Session != "" {
+			want = "Sub work"
+		}
+		if items.Entries[0].Content != want {
+			t.Errorf("session %q plan = %q, want %q", u.Session, items.Entries[0].Content, want)
+		}
+	}
+	if plans != 2 {
+		t.Fatalf("plan updates = %d, want one per session (2)", plans)
+	}
+}
