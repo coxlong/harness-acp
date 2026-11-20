@@ -355,14 +355,23 @@ func planEntry(content, activeForm, status string) schema.PlanEntry {
 	return schema.PlanEntry{Content: content, Priority: schema.PlanEntryPriorityMedium, Status: st}
 }
 
-// planUpdate replaces the checklist: plan_update, or plan_removed when empty.
+// planUpdate replaces the checklist. An empty list empties the plan, which is
+// how the protocol clears one: `plan_removed` is still experimental, so the
+// stable form is a plan_update whose entries are empty.
 func planUpdate(entries []schema.PlanEntry) backend.Event {
-	if len(entries) == 0 {
-		return update(schema.SessionUpdatePlanRemoved{PlanID: checklistPlanID})
+	return update(planUpdateOf(entries))
+}
+
+// planUpdateOf builds the update itself, for callers that send it directly.
+func planUpdateOf(entries []schema.PlanEntry) schema.SessionUpdatePlanUpdate {
+	if entries == nil {
+		entries = []schema.PlanEntry{} // an empty array, not null
 	}
-	return update(schema.SessionUpdatePlanUpdate{
-		Plan: schema.NewPlanUpdateContent(schema.PlanUpdateContentItems{PlanID: checklistPlanID, Entries: entries}),
-	})
+	return schema.SessionUpdatePlanUpdate{
+		Plan: schema.NewPlanUpdateContent(schema.PlanUpdateContentItems{
+			PlanID: checklistPlanID, Entries: entries,
+		}),
+	}
 }
 
 // todoWritePlan is a TodoWrite call's checklist.

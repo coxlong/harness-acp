@@ -646,15 +646,7 @@ func (h *history) emitPlan() {
 	if !h.seen {
 		return
 	}
-	if len(h.plan) == 0 {
-		h.emit(schema.NewSessionUpdate(schema.SessionUpdatePlanRemoved{PlanID: checklistPlanID}))
-		return
-	}
-	h.emit(schema.NewSessionUpdate(schema.SessionUpdatePlanUpdate{
-		Plan: schema.NewPlanUpdateContent(schema.PlanUpdateContentItems{
-			PlanID: checklistPlanID, Entries: h.plan,
-		}),
-	}))
+	h.emit(schema.NewSessionUpdate(planUpdateOf(h.plan)))
 }
 
 // flush emits the merged assistant message, if any.

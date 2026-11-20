@@ -1,6 +1,8 @@
 package claude
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	schema "github.com/ironpark/acp-go/schema/v2"
@@ -85,8 +87,22 @@ func TestReplayPlanCleared(t *testing.T) {
 
 	_, h := historyLines(t, "s-clear")
 	last := h.Updates[len(h.Updates)-1]
-	if _, ok := last.Update.Variant().(schema.SessionUpdatePlanRemoved); !ok {
-		t.Fatalf("last update = %T, want plan_removed", last.Update.Variant())
+	p, ok := last.Update.Variant().(schema.SessionUpdatePlanUpdate)
+	if !ok {
+		t.Fatalf("last update = %T, want an empty plan_update", last.Update.Variant())
+	}
+	items, _ := p.Plan.As[schema.PlanUpdateContentItems]()
+	if len(items.Entries) != 0 {
+		t.Fatalf("entries = %d, want none", len(items.Entries))
+	}
+	// An empty array, not null: the wire form has to be the one the schema
+	// names for clearing a plan.
+	raw, err := json.Marshal(last.Update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"entries":[]`) {
+		t.Fatalf("update = %s, want an empty entries array", raw)
 	}
 }
 
@@ -101,7 +117,7 @@ func TestReplayWithoutPlanSaysNothing(t *testing.T) {
 	_, h := historyLines(t, "s-none")
 	for _, u := range h.Updates {
 		switch u.Update.Variant().(type) {
-		case schema.SessionUpdatePlanUpdate, schema.SessionUpdatePlanRemoved:
+		case schema.SessionUpdatePlanUpdate:
 			t.Fatalf("unexpected plan update: %T", u.Update.Variant())
 		}
 	}
