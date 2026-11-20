@@ -9,7 +9,10 @@ Type=simple
 ExecStart=/usr/local/bin/harnessd
 Environment=HARNESSD_LISTEN=127.0.0.1:7800
 # systemd starts with a minimal PATH; the agent CLIs live in ~/.local/bin.
+# HOME is not set for system services, and both the CLI and harnessd's own
+# transcript lookup read ~/.claude, so it must be given explicitly.
 Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/root
 # Environment=HARNESSD_TOKEN=change-me
 Restart=on-failure
 RestartSec=2
