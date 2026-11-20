@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -23,6 +24,25 @@ import (
 
 	"github.com/coxlong/harness-acp/internal/backend"
 )
+
+// spawnEnv is the environment for an agent process.
+//
+// The client's plan panel is fed by the task tools (TaskCreate, TaskUpdate,
+// TaskList, TaskGet). The CLI loads them only for a model it recognizes; behind
+// a custom model name or an inference profile they are left out, and a session
+// then has no way to report a plan at all. The CLI's own switch for this is
+// turned on here unless the operator set it, so the toolset does not depend on
+// how harnessd happens to be launched.
+func spawnEnv() []string {
+	const flag = "CLAUDE_CODE_ENABLE_TODO_TOOLS"
+	env := os.Environ()
+	for _, e := range env {
+		if strings.HasPrefix(e, flag+"=") {
+			return env
+		}
+	}
+	return append(env, flag+"=true")
+}
 
 // RuntimeConfig controls per-runtime limits.
 type RuntimeConfig struct {
@@ -206,6 +226,7 @@ func (r *Runtime) spawn(sessionUUID string, o SpawnOpts) (*proc, error) {
 
 	cmd := exec.CommandContext(ctx, r.cfg.Binary, args...)
 	cmd.Dir = o.Cwd
+	cmd.Env = spawnEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
 	errTail := &tail{max: 4096}
 	cmd.Stderr = errTail
