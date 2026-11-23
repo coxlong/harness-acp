@@ -60,6 +60,36 @@ func requestError(t *testing.T, err error) *acp.RequestError {
 	return re
 }
 
+type setupBackend struct {
+	failingBackend
+}
+
+func (setupBackend) SavedOptions(_ context.Context, id, _ string, _ []string) (backend.Options, error) {
+	return backend.Options{}, &backend.SessionNotFoundError{ID: id}
+}
+
+func TestInitialConfigRejectsUnsupportedTypesAndDuplicates(t *testing.T) {
+	selectModel := schema.NewInitialSessionConfigOption(schema.InitialSessionConfigOptionID{ConfigID: "model", Value: "x"})
+	boolean := schema.NewInitialSessionConfigOption(schema.InitialSessionConfigOptionBoolean{ConfigID: "flag", Value: true})
+	client := wiredClient(t, setupBackend{}, nil)
+	for _, entries := range [][]schema.InitialSessionConfigOption{
+		{boolean}, {selectModel, selectModel},
+	} {
+		_, err := client.NewSession(t.Context(), &acp2.NewSessionRequest{Cwd: "/w", ConfigOptions: entries})
+		if !acp.IsCode(err, acp.ErrorCodeInvalidParams) {
+			t.Fatalf("session/new: got %v, want invalid params", err)
+		}
+	}
+}
+
+func TestOptionsForMissingSessionReturnsResourceNotFound(t *testing.T) {
+	client := wiredClient(t, setupBackend{}, nil)
+	_, err := client.GetSessionOptions(t.Context(), &acp2.SessionOptionsRequest{Cwd: "/w", SessionID: new(schema.SessionID("ghost"))})
+	if id, ok := acp.SessionNotFoundID(err); !ok || id != "ghost" {
+		t.Fatalf("session/options: got %v, want missing session ghost", err)
+	}
+}
+
 // A working directory that no longer exists is a parameter the agent cannot
 // honour: -32602, with a message that names the directory instead of blaming
 // the binary.

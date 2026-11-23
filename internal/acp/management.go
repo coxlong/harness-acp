@@ -24,9 +24,9 @@ func initialConfig(entries []schema.InitialSessionConfigOption) ([]backend.Confi
 			}
 			out = append(out, backend.ConfigSelection{ID: id, Value: string(v.Value)})
 		case schema.InitialSessionConfigOptionBoolean:
-			id = string(v.ConfigID)
+			return nil, acp.InvalidParams("initial configuration does not support boolean values")
 		case schema.InitialSessionConfigOptionCustom:
-			id = string(v.ConfigID)
+			return nil, acp.InvalidParams("unsupported initial config value type")
 		default:
 			return nil, acp.InvalidParams("invalid initial config option")
 		}
@@ -46,7 +46,7 @@ func (f *Facade) ForkSession(ctx context.Context, req *acp2.ForkSessionRequest) 
 	if !cwdAllowed(string(req.Cwd), f.allowDirs) {
 		return nil, acp.InvalidParams("fork working directory is outside the allowed roots")
 	}
-	initial, err := initialConfig(req.ConfigOptions)
+	initial, err := f.initialConfig(req.ConfigOptions)
 	if err != nil {
 		return nil, err
 	}

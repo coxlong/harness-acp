@@ -86,6 +86,9 @@ func (f *Facade) Initialize(_ context.Context, _ *acp2.InitializeRequest) (*acp2
 	if _, ok := f.be.(backend.SessionManager); !ok {
 		caps.Session.Fork, caps.Session.Archive, caps.Session.Title = nil, nil, nil
 	}
+	if _, ok := f.be.(backend.SessionSetup); !ok {
+		caps.Session.Options = nil
+	}
 	return &acp2.InitializeResponse{
 		ProtocolVersion: acp2.ProtocolVersion,
 		Capabilities:    caps,
@@ -103,7 +106,7 @@ func (f *Facade) NewSession(ctx context.Context, params *acp2.NewSessionRequest)
 		addDirs = append(addDirs, string(d))
 	}
 
-	initial, err := initialConfig(params.ConfigOptions)
+	initial, err := f.initialConfig(params.ConfigOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -130,13 +133,6 @@ func (f *Facade) NewSession(ctx context.Context, params *acp2.NewSessionRequest)
 // GetSessionOptions reports the config options and commands a session has, or
 // would start with in cwd, without creating or changing a session.
 func (f *Facade) GetSessionOptions(ctx context.Context, params *acp2.SessionOptionsRequest) (*acp2.SessionOptionsResponse, error) {
-	if params.SessionID != nil {
-		if handle, err := f.reg.Get(string(*params.SessionID)); err == nil {
-			o := handle.Options()
-			return &acp2.SessionOptionsResponse{ConfigOptions: o.Config, AvailableCommands: o.Commands}, nil
-		}
-		// Not active here: a session of that directory offers the same.
-	}
 	cwd := string(params.Cwd)
 	if !cwdAllowed(cwd, f.allowDirs) {
 		return nil, acp.InvalidParams(fmt.Sprintf("cwd %q is not under an allowed root", cwd))
@@ -145,11 +141,34 @@ func (f *Facade) GetSessionOptions(ctx context.Context, params *acp2.SessionOpti
 	for _, d := range params.AdditionalDirectories {
 		dirs = append(dirs, string(d))
 	}
-	o, err := f.be.Options(ctx, cwd, dirs)
+	var o backend.Options
+	var err error
+	if params.SessionID == nil {
+		// Keep the legacy workspace query usable for older clients.
+		o, err = f.be.Options(ctx, cwd, dirs)
+	} else if setup, ok := f.be.(backend.SessionSetup); ok {
+		id := string(*params.SessionID)
+		if handle, found := f.reg.Get(id); found == nil {
+			o = handle.Options()
+		} else {
+			o, err = setup.SavedOptions(ctx, id, cwd, dirs)
+		}
+	} else {
+		return nil, acp.MethodNotFound("session/options")
+	}
 	if err != nil {
 		return nil, backendError(err, "session options")
 	}
 	return &acp2.SessionOptionsResponse{ConfigOptions: o.Config, AvailableCommands: o.Commands}, nil
+}
+
+func (f *Facade) initialConfig(entries []schema.InitialSessionConfigOption) ([]backend.ConfigSelection, error) {
+	if len(entries) != 0 {
+		if _, ok := f.be.(backend.SessionSetup); !ok {
+			return nil, acp.InvalidParams("initial session configuration is unavailable")
+		}
+	}
+	return initialConfig(entries)
 }
 
 // SetSessionConfigOption changes one option of a session. The response lists
@@ -265,7 +284,7 @@ func parseOffsetCursor(c string) (int, bool) {
 // nothing that happens meanwhile is lost; live events wait in its channel.
 func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRequest) (*acp2.ResumeSessionResponse, error) {
 	id := string(params.SessionID)
-	initial, err := initialConfig(params.ConfigOptions)
+	initial, err := f.initialConfig(params.ConfigOptions)
 	if err != nil {
 		return nil, err
 	}

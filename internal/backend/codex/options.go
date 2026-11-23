@@ -72,11 +72,15 @@ func (s *Session) Options() backend.Options {
 }
 
 func (s *Session) optionsLocked() backend.Options {
-	out := options(s.model, s.effort, s.models)
-	out.Config = appendMode(out.Config, s.profile, s.profiles)
-	out.Config = appendCollaboration(out.Config, s.mode, s.model)
-	if s.provider != "" {
-		out.Config = append(out.Config, providerOption(s.provider, "Provider selected when this session was created", choice(s.provider, s.provider)))
+	return sessionOptions(s.model, s.effort, s.profile, s.mode, s.provider, s.models, s.profiles)
+}
+
+func sessionOptions(modelID, effort, profileID, mode, provider string, models []model, profiles []profile) backend.Options {
+	out := options(modelID, effort, models)
+	out.Config = appendMode(out.Config, profileID, profiles)
+	out.Config = appendCollaboration(out.Config, mode, modelID)
+	if provider != "" {
+		out.Config = append(out.Config, providerOption(provider, "Provider selected when this session was created", choice(provider, provider)))
 	}
 	return out
 }

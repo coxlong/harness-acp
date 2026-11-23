@@ -28,10 +28,11 @@ func (b *Backend) ForkSession(ctx context.Context, id string, f backend.NewSessi
 	}
 	params["threadId"], params["excludeTurns"] = id, true
 	params["runtimeWorkspaceRoots"] = append([]string{f.Cwd}, f.AdditionalDirectories...)
-	if err := b.applySetupConfig(ctx, p, f.Cwd, &source, f.Config, params); err != nil {
+	mode, err := b.applySetupConfig(ctx, p, f.Cwd, &source, f.Config, params)
+	if err != nil {
 		return nil, err
 	}
-	return b.open(ctx, "thread/fork", params, f.Config)
+	return b.open(ctx, "thread/fork", params, mode)
 }
 
 func (b *Backend) ArchiveSession(ctx context.Context, id string, archived bool) error {
@@ -167,6 +168,7 @@ type selectionOptions struct {
 	Model     string
 	Effort    string
 	Profile   string
+	Mode      string
 	Models    []model
 	Profiles  []profile
 	Providers []provider
@@ -225,6 +227,25 @@ func (b *Backend) setupCatalog(ctx context.Context, p *process, cwd string, sour
 		if source.Effort != "" {
 			state.Effort = source.Effort
 		}
+		settings, err := readTurnSettings(ctx, *source)
+		if err != nil {
+			return selectionOptions{}, err
+		}
+		if source.Model == "" && settings.Model != "" {
+			state.Model = settings.Model
+		}
+		if settings.Permission != nil {
+			state.Profile = settings.Permission.ID
+		}
+		if settings.Collaboration != nil {
+			state.Mode = settings.Collaboration.Mode
+			if source.Effort == "" && settings.Collaboration.Settings.Effort != "" {
+				state.Effort = settings.Collaboration.Settings.Effort
+			}
+		}
+		if source.Effort == "" && settings.Effort != "" {
+			state.Effort = settings.Effort
+		}
 	}
 	state.Models = p.models(ctx, state.Provider)
 	state.fillDefaultModel()
@@ -273,37 +294,64 @@ func (o *selectionOptions) selectValue(id, v string) bool {
 	return true
 }
 
-func (b *Backend) applySetupConfig(ctx context.Context, p *process, cwd string, source *thread, entries []backend.ConfigSelection, params object) error {
+func (b *Backend) applySetupConfig(ctx context.Context, p *process, cwd string, source *thread, entries []backend.ConfigSelection, params object) (string, error) {
 	if len(entries) == 0 {
-		return nil
+		return "", nil
 	}
 	state, err := b.setupCatalog(ctx, p, cwd, source)
 	if err != nil {
-		return err
+		return "", err
 	}
-	values := make(map[string]string, len(entries))
-	for _, v := range entries {
-		values[v.ID] = v.Value
+	if model, ok := params["model"].(string); ok {
+		state.Model = model
 	}
-	if target := values["provider"]; target != "" && target != state.Provider &&
-		slices.ContainsFunc(state.Providers, func(p provider) bool { return p.ID == target }) {
-		state.Provider, state.Model, state.Effort = target, "", ""
-		state.Models = p.models(ctx, target)
-		state.fillDefaultModel()
-		params["modelProvider"] = target
-		// A configured default model can belong to the old provider.
-		if state.Model != "" {
-			params["model"] = state.Model
+	var mode string
+	conf := object{}
+	for _, entry := range entries {
+		switch entry.ID {
+		case "provider":
+			if entry.Value == state.Provider || !slices.ContainsFunc(state.Providers, func(p provider) bool { return p.ID == entry.Value }) {
+				continue
+			}
+			state.Provider, state.Model, state.Effort = entry.Value, "", ""
+			state.Models = p.models(ctx, state.Provider)
+			state.fillDefaultModel()
+			params["modelProvider"] = state.Provider
+			delete(params, "model")
+			delete(conf, "model_reasoning_effort")
+			if state.Model != "" {
+				params["model"] = state.Model
+			}
+			if state.Effort != "" {
+				conf["model_reasoning_effort"] = state.Effort
+			}
+		case "model":
+			old := state.Model
+			if state.selectValue(entry.ID, entry.Value) {
+				params["model"] = state.Model
+				if state.Model != old {
+					delete(conf, "model_reasoning_effort")
+					if state.Effort != "" {
+						conf["model_reasoning_effort"] = state.Effort
+					}
+				}
+			}
+		case "reasoning_effort":
+			if state.selectValue(entry.ID, entry.Value) {
+				conf["model_reasoning_effort"] = state.Effort
+			}
+		case "mode":
+			if entry.Value != "default" && state.selectValue(entry.ID, entry.Value) {
+				params["permissions"] = state.Profile
+			}
+		case "collaboration_mode":
+			if state.Model != "" && collaborationMode(entry.Value) {
+				mode = entry.Value
+			}
 		}
 	}
-	if selected := values["model"]; selected != "" && state.selectValue("model", selected) {
-		params["model"] = state.Model
+	if len(conf) != 0 {
+		params["config"] = conf
 	}
-	if selected := values["reasoning_effort"]; selected != "" && state.selectValue("reasoning_effort", selected) {
-		params["config"] = object{"model_reasoning_effort": state.Effort}
-	}
-	if selected := values["mode"]; selected != "" && state.selectValue("mode", selected) && state.Profile != "" {
-		params["permissions"] = state.Profile
-	}
-	return nil
+	return mode, nil
 }

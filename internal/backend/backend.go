@@ -64,6 +64,11 @@ type SessionManager interface {
 	SetSessionTitle(context.Context, string, string) error
 }
 
+// SessionSetup implements the optional ACP session/options capability.
+type SessionSetup interface {
+	SavedOptions(ctx context.Context, id, cwd string, additionalDirs []string) (Options, error)
+}
+
 // ConfigSelection is one select value requested during session setup.
 type ConfigSelection struct {
 	ID    string

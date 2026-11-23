@@ -100,6 +100,7 @@ type thread struct {
 	Name        string `json:"name"`
 	Preview     string `json:"preview"`
 	UpdatedAt   int64  `json:"updatedAt"`
+	Path        string `json:"path"`
 	HistoryMode string `json:"historyMode"`
 	Model       string `json:"model"`
 	Provider    string `json:"modelProvider"`
@@ -142,10 +143,11 @@ func (b *Backend) NewSession(ctx context.Context, p backend.NewSessionParams) (b
 	if err != nil {
 		return nil, err
 	}
-	if err := b.applySetupConfig(ctx, proc, p.Cwd, nil, p.Config, params); err != nil {
+	mode, err := b.applySetupConfig(ctx, proc, p.Cwd, nil, p.Config, params)
+	if err != nil {
 		return nil, err
 	}
-	return b.open(ctx, "thread/start", params, p.Config)
+	return b.open(ctx, "thread/start", params, mode)
 }
 
 func (b *Backend) ResumeSession(ctx context.Context, id string, p backend.ResumeParams) (backend.SessionHandle, error) {
@@ -169,13 +171,14 @@ func (b *Backend) ResumeSession(ctx context.Context, id string, p backend.Resume
 	}
 	params["threadId"] = id
 	params["excludeTurns"] = true
-	if err := b.applySetupConfig(ctx, proc, t.Cwd, &t, p.Config, params); err != nil {
+	mode, err := b.applySetupConfig(ctx, proc, t.Cwd, &t, p.Config, params)
+	if err != nil {
 		return nil, err
 	}
-	return b.open(ctx, "thread/resume", params, p.Config)
+	return b.open(ctx, "thread/resume", params, mode)
 }
 
-func (b *Backend) open(ctx context.Context, method string, params object, initial []backend.ConfigSelection) (backend.SessionHandle, error) {
+func (b *Backend) open(ctx context.Context, method string, params object, mode string) (backend.SessionHandle, error) {
 	p, err := b.connect(ctx)
 	if err != nil {
 		return nil, err
@@ -191,10 +194,8 @@ func (b *Backend) open(ctx context.Context, method string, params object, initia
 	s := newSession(p, result)
 	s.fresh = method == "thread/start"
 	s.instructions, _ = params["developerInstructions"].(string)
-	for _, selected := range initial {
-		if selected.ID == "collaboration_mode" && collaborationMode(selected.Value) {
-			s.mode, s.sendMode = selected.Value, true
-		}
+	if mode != "" {
+		s.mode, s.sendMode = mode, true
 	}
 	active, err := p.put(s)
 	if err != nil {
