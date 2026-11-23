@@ -15,6 +15,26 @@ go build -o harnessd ./cmd/harnessd
 ./harnessd
 ```
 
+### 安装为 systemd 用户服务
+
+在 Linux 上用自己的账号执行以下命令。服务使用该账号的 Agent 配置，首次安装会生成随机访问令牌并以 `0600` 权限保存。再次安装或升级会复用令牌。
+
+```bash
+go build -o harnessd ./cmd/harnessd
+./deploy/install-user.sh ./harnessd
+systemctl --user status harnessd
+```
+
+在自己的终端读取令牌并填入 Harness Go 的连接设置。
+
+```bash
+cut -d= -f2- "${XDG_CONFIG_HOME:-$HOME/.config}/harnessd/token.env"
+```
+
+默认监听 `127.0.0.1:7800`。要让手机在局域网直连，在 `${XDG_CONFIG_HOME:-$HOME/.config}/harnessd/settings.env` 写入 `HARNESSD_LISTEN=0.0.0.0:7800`，然后执行 `systemctl --user restart harnessd`。在手机上填服务器的局域网地址和端口 `7800`，以及生成的令牌。
+
+如果 Agent CLI 使用自定义安装路径，可在 `settings.env` 中设置 `PATH`。需要让服务在退出登录后继续运行时，可在系统允许的情况下为该账号启用 systemd linger。
+
 ### Codex
 
 将 Codex CLI 0.171.0 或更新版本加入 `PATH`。启动后，`GET /v1/agents` 会返回通过握手的 Codex，客户端可以连接 `/acp/codex`。本地 ACP 客户端也可以用 stdio 启动。

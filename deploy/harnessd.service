@@ -1,22 +1,18 @@
 [Unit]
 Description=harnessd - ACP v2 gateway for local coding agents
 Documentation=https://github.com/coxlong/harness-acp
-After=network-online.target
-Wants=network-online.target
+ConditionUser=!root
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/harnessd
+ExecStart=%h/.local/bin/harnessd
 Environment=HARNESSD_LISTEN=127.0.0.1:7800
-# systemd starts with a minimal PATH; the agent CLIs live in ~/.local/bin.
-# HOME is not set for system services, and both the CLI and harnessd's own
-# transcript lookup read ~/.claude, so it must be given explicitly.
-Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=HOME=/root
-# Environment=HARNESSD_TOKEN=change-me
+Environment="PATH=%h/.local/bin:%h/go/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=-%E/harnessd/settings.env
+EnvironmentFile=%E/harnessd/token.env
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
