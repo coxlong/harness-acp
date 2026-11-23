@@ -42,7 +42,7 @@ func Default() Config {
 		Listen: env("HARNESSD_LISTEN", "127.0.0.1:7800"),
 		Token:  os.Getenv("HARNESSD_TOKEN"),
 		Agents: AgentsCfg{
-			Codex:  AgentCfg{Enabled: true, MinVersion: "0.169.0"},
+			Codex:  AgentCfg{Enabled: true, MinVersion: "0.171.0"},
 			Claude: AgentCfg{Enabled: true, MinVersion: "2.1.0"},
 		},
 		Session: SessionCfg{

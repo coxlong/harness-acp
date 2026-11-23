@@ -46,13 +46,33 @@ type AgentInfo struct {
 
 // ListFilter selects one page of session list results.
 type ListFilter struct {
-	Cwd    string // only sessions of exactly this directory; empty for all
-	Offset int    // sessions to skip, newest first
-	Limit  int    // page size; 0 for no limit
+	Cwd      string // only sessions of exactly this directory; empty for all
+	Offset   int    // sessions to skip, newest first
+	Limit    int    // page size; 0 for no limit
+	Archived string // exclude, only, or include
+}
+
+// CursorLister preserves a backend's pagination tokens across ACP requests.
+type CursorLister interface {
+	ListSessionsPage(ctx context.Context, f ListFilter, cursor *string) ([]SessionInfo, *string, error)
+}
+
+// SessionManager implements optional ACP session management methods.
+type SessionManager interface {
+	ForkSession(context.Context, string, NewSessionParams) (SessionHandle, error)
+	ArchiveSession(context.Context, string, bool) error
+	SetSessionTitle(context.Context, string, string) error
+}
+
+// ConfigSelection is one select value requested during session setup.
+type ConfigSelection struct {
+	ID    string
+	Value string
 }
 
 // NewSessionParams carries session/new parameters.
 type NewSessionParams struct {
+	Config                []ConfigSelection
 	Cwd                   string
 	AdditionalDirectories []string
 	Model                 string
@@ -61,6 +81,7 @@ type NewSessionParams struct {
 
 // ResumeParams carries session/resume parameters.
 type ResumeParams struct {
+	Config                []ConfigSelection
 	Cwd                   string
 	AdditionalDirectories []string
 }
@@ -71,6 +92,7 @@ type SessionInfo struct {
 	Cwd       string
 	Title     string
 	UpdatedAt time.Time // last activity
+	Archived  *bool
 }
 
 // Options is what a client can configure and invoke in a session: config
@@ -111,10 +133,11 @@ type History struct {
 type EventKind int
 
 const (
-	EventUpdate     EventKind = iota // content update: Update is set
-	EventTurnState                   // foreground state change: Turn is set
-	EventPermission                  // pending tool authorisation: Permission is set
-	EventFatal                       // session is dead: Err is set
+	EventUpdate      EventKind = iota // content update: Update is set
+	EventTurnState                    // foreground state change: Turn is set
+	EventPermission                   // pending tool authorisation: Permission is set
+	EventFatal                        // session is dead: Err is set
+	EventElicitation                  // live user input request: Elicitation is set
 )
 
 // TurnState is the session's foreground state (ACP v2 state_update).
@@ -157,16 +180,25 @@ type Decision struct {
 	Cancelled bool
 }
 
+// Elicitation is a live, single-recipient request. Context ends when the
+// native request is resolved, and Reply must tolerate racing cancellation.
+type Elicitation struct {
+	Context context.Context
+	Request acp2.CreateElicitationRequest
+	Reply   func(*acp2.CreateElicitationResponse)
+}
+
 // Event is one item from SessionHandle.Events().
 type Event struct {
 	// Session is the child session (a subagent's) the event belongs to; empty
 	// for the session itself.
-	Session    string
-	Kind       EventKind
-	Update     acp2.SessionUpdate // Kind == EventUpdate
-	Turn       TurnEvent          // Kind == EventTurnState
-	Permission PermissionRequest  // Kind == EventPermission
-	Err        error              // Kind == EventFatal
+	Session     string
+	Kind        EventKind
+	Update      acp2.SessionUpdate // Kind == EventUpdate
+	Turn        TurnEvent          // Kind == EventTurnState
+	Permission  PermissionRequest  // Kind == EventPermission
+	Err         error              // Kind == EventFatal
+	Elicitation *Elicitation       // Kind == EventElicitation
 }
 
 // Backend is a process-level singleton for one agent type.

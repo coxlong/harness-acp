@@ -2,9 +2,9 @@ package registry
 
 import (
 	"context"
-	"fmt"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -34,7 +34,7 @@ func New() *Registry {
 
 // Probe checks whether name is available on PATH, reads its version, and
 // returns an AgentInfo whose Available field is true only when the binary is
-// found and its version is >= minVersion (lexicographic / semver-ish).
+// found and its version is >= minVersion.
 func (r *Registry) Probe(ctx context.Context, name, displayName, minVersion string) AgentInfo {
 	info := AgentInfo{
 		Name:        name,
@@ -59,7 +59,7 @@ func (r *Registry) Probe(ctx context.Context, name, displayName, minVersion stri
 	}
 
 	info.Version = version
-	if version >= minVersion {
+	if versionAtLeast(version, minVersion) {
 		info.Available = true
 	}
 
@@ -119,5 +119,19 @@ func (r *Registry) List() []AgentInfo {
 	return result
 }
 
-// ensure fmt is used (avoids import error if callers do not use Sprintf)
-var _ = fmt.Sprintf
+func versionAtLeast(version, minimum string) bool {
+	actual, required := strings.Split(version, "."), strings.Split(minimum, ".")
+	for i := range max(len(actual), len(required)) {
+		var a, b uint64
+		if i < len(actual) {
+			a, _ = strconv.ParseUint(actual[i], 10, 64)
+		}
+		if i < len(required) {
+			b, _ = strconv.ParseUint(required[i], 10, 64)
+		}
+		if a != b {
+			return a > b
+		}
+	}
+	return true
+}

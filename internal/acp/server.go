@@ -56,6 +56,10 @@ func (s *Server) setup() {
 
 		agentCfg := s.agentConfig(name)
 		reg := s.reg
+		if len(s.backends) > 1 {
+			// Native IDs and subscriptions belong to their agent endpoint.
+			reg = session.New(s.cfg.Session.ReplayBufSize)
+		}
 
 		srv := acphttp.NewServer(
 			func(ctx context.Context, t acp.Transport) error {

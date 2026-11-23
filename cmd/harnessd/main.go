@@ -14,6 +14,7 @@ import (
 	acppkg "github.com/coxlong/harness-acp/internal/acp"
 	"github.com/coxlong/harness-acp/internal/backend"
 	claudebe "github.com/coxlong/harness-acp/internal/backend/claude"
+	codexbe "github.com/coxlong/harness-acp/internal/backend/codex"
 	"github.com/coxlong/harness-acp/internal/config"
 	"github.com/coxlong/harness-acp/internal/registry"
 	"github.com/coxlong/harness-acp/internal/session"
@@ -49,13 +50,29 @@ func run(ctx context.Context, cfg config.Config, stdioMode bool, agentName strin
 	backends := make(map[string]backend.Backend)
 	sess := session.New(cfg.Session.ReplayBufSize)
 
-	// The codex backend is being rewritten against codex-acp; until it lands,
-	// only claude is served.
-	if cfg.Agents.Codex.Enabled {
-		log.Printf("codex backend is not available yet; skipping")
+	if cfg.Agents.Codex.Enabled && (!stdioMode || agentName == "codex") {
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		info := agentReg.Probe(probeCtx, "codex", "Codex", cfg.Agents.Codex.MinVersion)
+		if info.Available {
+			be := codexbe.New(ctx, "codex", cfg.Agents.Codex.AllowDirs)
+			_, err := be.Probe(probeCtx)
+			if err == nil {
+				backends["codex"] = be
+				defer be.Close()
+				log.Printf("codex backend ready (v%s)", info.Version)
+			} else {
+				_ = be.Close()
+				info.Available = false
+				log.Printf("codex app-server unavailable: %v", err)
+			}
+		} else {
+			log.Printf("codex not available (not found or version too old)")
+		}
+		cancel()
+		agentReg.Register(info)
 	}
 
-	if cfg.Agents.Claude.Enabled {
+	if cfg.Agents.Claude.Enabled && (!stdioMode || agentName == "claude") {
 		info := agentReg.Probe(ctx, "claude", "Claude", cfg.Agents.Claude.MinVersion)
 		agentReg.Register(info)
 		if info.Available {
@@ -63,7 +80,9 @@ func run(ctx context.Context, cfg config.Config, stdioMode bool, agentName strin
 				IdleTTL:  cfg.Session.ClaudeIdleTTL,
 				MaxProcs: 20,
 			})
-			backends["claude"] = claudebe.NewBackend(rt)
+			be := claudebe.NewBackend(rt)
+			backends["claude"] = be
+			defer be.Close()
 			log.Printf("claude backend ready (v%s)", info.Version)
 		} else {
 			log.Printf("claude not available (not found or version too old)")

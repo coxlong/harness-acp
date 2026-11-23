@@ -35,7 +35,13 @@ type Facade struct {
 	conn      *acp2.AgentSideConnection
 
 	mu       sync.Mutex
-	attached map[string]func() // session id → unsubscribe
+	attached map[string]*subscription
+}
+
+type subscription struct {
+	session.Subscription
+	started chan struct{}
+	done    chan struct{}
 }
 
 // NewFacade creates a Facade. conn is provided by NewAgentSideConnection's
@@ -43,7 +49,7 @@ type Facade struct {
 func NewFacade(name string, be backend.Backend, reg *session.Registry, allowDirs []string, conn *acp2.AgentSideConnection) *Facade {
 	return &Facade{
 		name: name, be: be, reg: reg, allowDirs: allowDirs, conn: conn,
-		attached: make(map[string]func()),
+		attached: make(map[string]*subscription),
 	}
 }
 
@@ -72,9 +78,17 @@ func backendError(err error, op string) error {
 
 // Initialize negotiates the ACP v2 protocol version.
 func (f *Facade) Initialize(_ context.Context, _ *acp2.InitializeRequest) (*acp2.InitializeResponse, error) {
+	caps := acp2.CapabilitiesOf(f)
+	if f.name == "codex" {
+		caps.Session.Prompt = &schema.PromptCapabilities{Image: &schema.PromptImageCapabilities{}}
+		caps.Session.AdditionalDirectories = &schema.SessionAdditionalDirectoriesCapabilities{}
+	}
+	if _, ok := f.be.(backend.SessionManager); !ok {
+		caps.Session.Fork, caps.Session.Archive, caps.Session.Title = nil, nil, nil
+	}
 	return &acp2.InitializeResponse{
 		ProtocolVersion: acp2.ProtocolVersion,
-		Capabilities:    acp2.CapabilitiesOf(f),
+		Capabilities:    caps,
 	}, nil
 }
 
@@ -89,14 +103,18 @@ func (f *Facade) NewSession(ctx context.Context, params *acp2.NewSessionRequest)
 		addDirs = append(addDirs, string(d))
 	}
 
-	handle, err := f.be.NewSession(ctx, backend.NewSessionParams{Cwd: cwd, AdditionalDirectories: addDirs})
+	initial, err := initialConfig(params.ConfigOptions)
+	if err != nil {
+		return nil, err
+	}
+	handle, err := f.be.NewSession(ctx, backend.NewSessionParams{Cwd: cwd, AdditionalDirectories: addDirs, Config: initial})
 	if err != nil {
 		log.Printf("new session rejected: cwd=%s: %v", cwd, err)
 		return nil, backendError(err, "new session")
 	}
 	id := handle.NativeID()
 	f.reg.Register(id, f.name, handle)
-	_, _, start, err := f.attach(id, nil)
+	_, start, err := f.attach(id, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -164,6 +182,12 @@ const sessionListPage = 1000
 // invalid params.
 func (f *Facade) ListSessions(ctx context.Context, params *acp2.ListSessionsRequest) (*acp2.ListSessionsResponse, error) {
 	filter := backend.ListFilter{Limit: sessionListPage}
+	if params.Archived != nil {
+		if _, ok := f.be.(backend.SessionManager); !ok || !params.Archived.Known() {
+			return nil, acp.InvalidParams("unsupported archive filter")
+		}
+		filter.Archived = string(*params.Archived)
+	}
 	if params.Cwd != nil && *params.Cwd != "" {
 		cwd := string(*params.Cwd)
 		if !filepath.IsAbs(cwd) {
@@ -171,17 +195,35 @@ func (f *Facade) ListSessions(ctx context.Context, params *acp2.ListSessionsRequ
 		}
 		filter.Cwd = cwd
 	}
-	if params.Cursor != nil {
-		offset, ok := parseOffsetCursor(string(*params.Cursor))
-		if !ok {
-			return nil, acp.InvalidParams(fmt.Sprintf("unknown session/list cursor: %s", *params.Cursor))
+	var sessions []backend.SessionInfo
+	var nextCursor *schema.SessionListCursor
+	var err error
+	if native, ok := f.be.(backend.CursorLister); ok {
+		var cursor *string
+		if params.Cursor != nil {
+			cursor = new(string(*params.Cursor))
 		}
-		filter.Offset = offset
+		var next *string
+		sessions, next, err = native.ListSessionsPage(ctx, filter, cursor)
+		if next != nil {
+			nextCursor = new(schema.SessionListCursor(*next))
+		}
+	} else {
+		if params.Cursor != nil {
+			offset, ok := parseOffsetCursor(string(*params.Cursor))
+			if !ok {
+				return nil, acp.InvalidParams(fmt.Sprintf("unknown session/list cursor: %s", *params.Cursor))
+			}
+			filter.Offset = offset
+		}
+		var more bool
+		sessions, more, err = f.be.ListSessions(ctx, filter)
+		if more {
+			nextCursor = new(schema.SessionListCursor(fmt.Sprintf("offset:%d", filter.Offset+sessionListPage)))
+		}
 	}
-
-	sessions, more, err := f.be.ListSessions(ctx, filter)
 	if err != nil {
-		return nil, err
+		return nil, backendError(err, "list sessions")
 	}
 	infos := make([]acp2.SessionInfo, 0, len(sessions))
 	for _, s := range sessions {
@@ -192,14 +234,10 @@ func (f *Facade) ListSessions(ctx context.Context, params *acp2.ListSessionsRequ
 			Cwd:       schema.AbsolutePath(s.Cwd),
 			Title:     &title,
 			UpdatedAt: &updated,
+			Archived:  s.Archived,
 		})
 	}
-	resp := &acp2.ListSessionsResponse{Sessions: infos}
-	if more {
-		next := schema.SessionListCursor(fmt.Sprintf("offset:%d", filter.Offset+sessionListPage))
-		resp.NextCursor = &next
-	}
-	return resp, nil
+	return &acp2.ListSessionsResponse{Sessions: infos, NextCursor: nextCursor}, nil
 }
 
 // parseOffsetCursor reads an `offset:N` cursor.
@@ -227,13 +265,30 @@ func parseOffsetCursor(c string) (int, bool) {
 // nothing that happens meanwhile is lost; live events wait in its channel.
 func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRequest) (*acp2.ResumeSessionResponse, error) {
 	id := string(params.SessionID)
-
-	if _, err := f.reg.Get(id); err != nil {
+	initial, err := initialConfig(params.ConfigOptions)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := f.reg.LockLifecycle(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	active, err := f.reg.Get(id)
+	if err != nil {
 		cwd := string(params.Cwd)
 		if cwd != "" && !cwdAllowed(cwd, f.allowDirs) {
 			return nil, acp.InvalidParams(fmt.Sprintf("cwd %q is not under an allowed root", cwd))
 		}
-		handle, err := f.be.ResumeSession(ctx, id, backend.ResumeParams{Cwd: cwd})
+		var dirs []string
+		for _, dir := range params.AdditionalDirectories {
+			dirs = append(dirs, string(dir))
+		}
+		setup := initial
+		if _, start := params.ReplayFrom.Variant().(schema.ReplayFromStart); !start && !params.ReplayFrom.IsZero() {
+			setup = nil
+		}
+		handle, err := f.be.ResumeSession(ctx, id, backend.ResumeParams{Cwd: cwd, AdditionalDirectories: dirs, Config: setup})
 		if err != nil {
 			log.Printf("session %s: resume rejected: cwd=%s: %v", id, cwd, err)
 			return nil, backendError(err, "resume session")
@@ -241,22 +296,24 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 		f.reg.Register(id, f.name, handle)
 	}
 
-	var afterSeq *uint64
+	var cursor *session.Cursor
 	fromStart := false
 	if !params.ReplayFrom.IsZero() {
 		switch v := params.ReplayFrom.Variant().(type) {
 		case schema.ReplayFromStart:
 			fromStart = true
 		case schema.ReplayFromCustom:
-			seq, ok := parseHarnessSeq(v)
+			value, ok := parseHarnessCursor(v)
 			if !ok {
 				return nil, acp.InvalidParams(fmt.Sprintf("unrecognised replayFrom cursor %q", v.Type))
 			}
-			afterSeq = &seq
+			cursor = &value
+		default:
+			return nil, acp.InvalidParams("unsupported replay cursor")
 		}
 	}
 
-	replay, state, start, err := f.attach(id, afterSeq)
+	sub, start, err := f.attach(id, cursor, fromStart)
 	if err != nil {
 		if errors.Is(err, session.ErrReplayGap) {
 			return nil, acp.InvalidParams(err.Error())
@@ -274,15 +331,31 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 			f.detach(id)
 		}
 	}()
+	if setter, ok := active.(interface {
+		ConfigureInitial(context.Context, []backend.ConfigSelection) error
+	}); ok && len(initial) > 0 {
+		if err := setter.ConfigureInitial(ctx, initial); err != nil {
+			return nil, backendError(err, "resume configuration")
+		}
+	}
 
-	if fromStart || afterSeq != nil {
+	if fromStart || cursor != nil {
 		sid := params.SessionID
 		var hist backend.History
 		if fromStart {
 			var err error
 			hist, err = f.be.History(ctx, id)
 			if err != nil {
-				return nil, fmt.Errorf("replay history: %w", err)
+				return nil, backendError(err, "replay history")
+			}
+			children := make(map[string]bool, len(hist.Children))
+			for _, child := range hist.Children {
+				children[child.ID] = true
+			}
+			for _, u := range sub.LiveOutput {
+				if u.Session == "" || children[u.Session] {
+					hist.Updates = append(hist.Updates, u)
+				}
 			}
 			for _, u := range hist.Updates {
 				target := sid
@@ -307,8 +380,8 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 				}
 			}
 		}
-		for _, ev := range replay {
-			if err := f.emit(ctx, acp2.NewSessionStream(f.conn, sid), sid, ev); err != nil {
+		for _, ev := range sub.Replay {
+			if err := f.emit(ctx, sid, ev); err != nil {
 				return nil, err
 			}
 		}
@@ -343,7 +416,7 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 	}
 
 	// The snapshot tells the client whether a turn is open right now.
-	if err := f.snapshot(ctx, params.SessionID, state); err != nil {
+	if err := f.snapshot(ctx, params.SessionID, sub.State, sub.Cursor); err != nil {
 		return nil, err
 	}
 	resumed = true
@@ -358,9 +431,46 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 // CloseSession closes a session and drops this connection's subscription.
 func (f *Facade) CloseSession(ctx context.Context, params *acp2.CloseSessionRequest) (*acp2.CloseSessionResponse, error) {
 	id := string(params.SessionID)
-	f.detach(id)
-	_ = f.reg.Remove(ctx, id)
+	unlock, err := f.reg.LockLifecycle(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if err := f.closeSession(ctx, id); err != nil {
+		return nil, err
+	}
 	return &acp2.CloseSessionResponse{}, nil
+}
+
+func (f *Facade) closeSession(ctx context.Context, id string) error {
+	if f.name != "codex" {
+		f.detach(id)
+		_ = f.reg.Remove(ctx, id)
+		return nil
+	}
+
+	f.mu.Lock()
+	sub := f.attached[id]
+	f.mu.Unlock()
+	err := f.reg.Remove(ctx, id)
+	if sub != nil {
+		select {
+		case <-sub.started:
+			// Once the native session closes, the forwarder drains its final
+			// cancelled update before this connection receives the close reply.
+			select {
+			case <-sub.done:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		default:
+			f.detach(id)
+		}
+	}
+	if err != nil {
+		return backendError(err, "close session")
+	}
+	return nil
 }
 
 // DeleteSession removes a session and its stored history. An active session is
@@ -368,6 +478,11 @@ func (f *Facade) CloseSession(ctx context.Context, params *acp2.CloseSessionRequ
 // that is not there is not an error, as the protocol asks.
 func (f *Facade) DeleteSession(ctx context.Context, params *acp2.DeleteSessionRequest) (*acp2.DeleteSessionResponse, error) {
 	id := string(params.SessionID)
+	unlock, err := f.reg.LockLifecycle(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	f.detach(id)
 	if err := f.reg.Remove(ctx, id); err != nil {
 		return nil, backendError(err, "delete session "+id)
@@ -531,7 +646,7 @@ func (f *Facade) Prompt(ctx context.Context, params *acp2.PromptRequest) (*acp2.
 	}
 	msgID, err := handle.Send(ctx, params.Prompt)
 	if err != nil {
-		return nil, err
+		return nil, backendError(err, "")
 	}
 	return &acp2.PromptResponse{MessageID: msgID}, nil
 }
@@ -542,62 +657,90 @@ func (f *Facade) Prompt(ctx context.Context, params *acp2.PromptRequest) (*acp2.
 // before live events: the ring-buffer replay (when afterSeq is set), the
 // session's current state, and a start func that begins forwarding live
 // events. Attaching twice replaces the earlier subscription.
-func (f *Facade) attach(id string, afterSeq *uint64) ([]backend.Event, backend.TurnEvent, func(), error) {
-	replay, state, ch, unsub, err := f.reg.SubscribeReplay(id, afterSeq)
+func (f *Facade) attach(id string, cursor *session.Cursor, fromStart bool) (*subscription, func(), error) {
+	caps := f.conn.ClientCapabilities()
+	form := caps != nil && caps.Elicitation != nil && caps.Elicitation.Form != nil
+	attached, err := f.reg.Attach(id, cursor, form, fromStart)
 	if err != nil {
-		return nil, backend.TurnEvent{}, nil, err
+		return nil, nil, err
 	}
+	sub := &subscription{Subscription: attached, started: make(chan struct{}), done: make(chan struct{})}
 	f.mu.Lock()
 	if old := f.attached[id]; old != nil {
-		old() // closes the old channel, which ends its forwarding goroutine
+		old.Unsubscribe()
 	}
-	f.attached[id] = unsub
+	f.attached[id] = sub
 	f.mu.Unlock()
 
-	started := false
-	start := func() {
-		if started {
-			return
-		}
-		started = true
-		go f.forward(acp2.SessionID(id), ch)
-	}
-	return replay, state, start, nil
+	start := sync.OnceFunc(func() {
+		close(sub.started)
+		go f.forward(acp2.SessionID(id), sub)
+	})
+	return sub, start, nil
 }
 
 func (f *Facade) detach(id string) {
 	f.mu.Lock()
-	unsub := f.attached[id]
+	sub := f.attached[id]
 	delete(f.attached, id)
 	f.mu.Unlock()
-	if unsub != nil {
-		unsub()
+	if sub != nil {
+		sub.Unsubscribe()
 	}
 }
 
 // forward sends a session's live events to this connection until the
 // subscription closes or the connection ends. One goroutine per attached
 // session.
-func (f *Facade) forward(id acp2.SessionID, ch <-chan backend.Event) {
+func (f *Facade) forward(id acp2.SessionID, sub *subscription) {
+	defer close(sub.done)
+	defer func() {
+		sub.Unsubscribe()
+		f.mu.Lock()
+		if f.attached[string(id)] == sub {
+			delete(f.attached, string(id))
+		}
+		f.mu.Unlock()
+	}()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
 		select {
 		case <-f.conn.Done():
 			cancel() // also aborts a permission request still waiting for the user
+		case <-sub.Overflow:
+			cancel()
+			_ = f.conn.Close()
 		case <-ctx.Done():
 		}
 	}()
 
 	stream := acp2.NewSessionStream(f.conn, id)
-	for ev := range ch {
-		if ev.Kind == backend.EventPermission {
-			// Answered in its own goroutine: the user may take minutes, and the
-			// events behind this one must keep flowing meanwhile.
+	for {
+		var ev session.Delivery
+		select {
+		case <-ctx.Done():
+			return
+		case e, ok := <-sub.Events:
+			if !ok {
+				select {
+				case <-sub.Overflow:
+					_ = f.conn.Close()
+				default:
+				}
+				return
+			}
+			ev = e
+		}
+		switch ev.Kind {
+		case backend.EventPermission:
 			go f.askPermission(ctx, stream, id, ev.Permission)
 			continue
+		case backend.EventElicitation:
+			go f.elicit(ctx, ev.Elicitation)
+			continue
 		}
-		if err := f.emit(ctx, stream, id, ev); err != nil {
+		if err := f.emit(ctx, id, ev); err != nil {
 			log.Printf("session %s: forwarding failed: %v", id, err)
 			return
 		}
@@ -606,21 +749,40 @@ func (f *Facade) forward(id acp2.SessionID, ch <-chan backend.Event) {
 
 // emit sends one non-permission event, to the session it belongs to: a child
 // session's events go to the child.
-func (f *Facade) emit(ctx context.Context, stream *acp2.SessionStream, id acp2.SessionID, ev backend.Event) error {
+func (f *Facade) emit(ctx context.Context, id acp2.SessionID, ev session.Delivery) error {
 	if ev.Session != "" {
 		id = acp2.SessionID(ev.Session)
-		stream = acp2.NewSessionStream(f.conn, id)
 	}
+	var update acp2.SessionUpdate
 	switch ev.Kind {
 	case backend.EventUpdate:
-		return f.sendUpdate(ctx, id, ev.Update)
+		update = ev.Update
 	case backend.EventTurnState:
-		return stream.Send(ctx, schema.SessionUpdateStateUpdate{Value: stateUpdate(ev.Turn)})
+		update = schema.NewSessionUpdate(schema.SessionUpdateStateUpdate{Value: stateUpdate(ev.Turn)})
 	case backend.EventFatal:
 		log.Printf("session %s fatal: %v", id, ev.Err)
-		return stream.IdleError(ctx, ev.Err)
+		update = schema.NewSessionUpdate(schema.SessionUpdateStateUpdate{Value: stateUpdate(backend.TurnEvent{Err: ev.Err})})
+	default:
+		return nil
 	}
-	return nil
+	return f.conn.SessionUpdate(ctx, &acp2.UpdateSessionNotification{
+		SessionID: id, Update: update, Meta: cursorMeta(ev.Cursor),
+	})
+}
+
+func (f *Facade) elicit(ctx context.Context, request *backend.Elicitation) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(request.Context, cancel)
+	defer stop()
+	if request.Context.Err() != nil {
+		return
+	}
+	response, err := f.conn.CreateElicitation(ctx, &request.Request)
+	if err != nil {
+		response = nil
+	}
+	request.Reply(response)
 }
 
 // stateUpdate builds the state_update for a turn event, with its background
@@ -668,9 +830,11 @@ func idleUpdate(t backend.TurnEvent) schema.IdleStateUpdate {
 
 // snapshot reports the foreground state a resuming client joins in the middle
 // of. An idle snapshot carries no stop reason: it is not a new completion.
-func (f *Facade) snapshot(ctx context.Context, id acp2.SessionID, state backend.TurnEvent) error {
+func (f *Facade) snapshot(ctx context.Context, id acp2.SessionID, state backend.TurnEvent, cursor session.Cursor) error {
 	state.StopReason, state.Err = "", nil
-	return acp2.NewSessionStream(f.conn, id).Send(ctx, schema.SessionUpdateStateUpdate{Value: stateUpdate(state)})
+	return f.emit(ctx, id, session.Delivery{
+		Event: backend.Event{Kind: backend.EventTurnState, Turn: state}, Cursor: cursor,
+	})
 }
 
 func (f *Facade) sendUpdate(ctx context.Context, id acp2.SessionID, u acp2.SessionUpdate) error {
@@ -713,18 +877,28 @@ func (f *Facade) askPermission(ctx context.Context, stream *acp2.SessionStream, 
 
 // --- helpers ----------------------------------------------------------------
 
-// parseHarnessSeq extracts the seq field from a _harness/seq custom cursor.
-func parseHarnessSeq(c schema.ReplayFromCustom) (uint64, bool) {
-	if c.Type != "_harness/seq" {
-		return 0, false
+const replayCursorType = "_harness/seq"
+
+func cursorMeta(cursor session.Cursor) schema.Meta {
+	var meta schema.Meta
+	_ = meta.Set("_harness/replayCursor", struct {
+		Type string `json:"type"`
+		session.Cursor
+	}{replayCursorType, cursor})
+	return meta
+}
+
+func parseHarnessCursor(c schema.ReplayFromCustom) (session.Cursor, bool) {
+	var cursor session.Cursor
+	if c.Type != replayCursorType {
+		return cursor, false
 	}
-	raw, ok := c.AdditionalProperties["seq"]
-	if !ok {
-		return 0, false
+	if json.Unmarshal(c.AdditionalProperties["generation"], &cursor.Generation) != nil || cursor.Generation == "" {
+		return cursor, false
 	}
-	var n float64
-	if err := json.Unmarshal([]byte(raw), &n); err != nil || n < 0 {
-		return 0, false
+	seq := c.AdditionalProperties["seq"]
+	if len(seq) == 0 || string(seq) == "null" || json.Unmarshal(seq, &cursor.Seq) != nil {
+		return cursor, false
 	}
-	return uint64(n), true
+	return cursor, true
 }
