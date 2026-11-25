@@ -49,6 +49,19 @@ Codex 的 `request_user_input` 会转成 ACP v2 表单。客户端须在初始�
 
 Codex 实时结束一段回复或思考时，相应的 `agent_message` 或 `agent_thought` 更新包含 `_meta["_harness/streamComplete"]: true`。如果结束事件只确认了已流式传输的内容，更新会省略 `content`，客户端保留已接收的文本。
 
+`usage_update` 的 `_meta["_harness/tokens"]` 给出用量构成，协议本身只有 `used`/`size`/`cost` 三个字段：
+
+```json
+"_harness/tokens": {
+  "context":  { "input": 243, "cached": 132992, "cacheWrite": 0, "output": 906 },
+  "lifetime": { "input": 162913, "cached": 2068992, "cacheWrite": 0, "output": 5436 }
+}
+```
+
+`context` 是当前上下文 `used` 的构成（四项之和等于 `used`），仅在分项已知时提供。`lifetime` 是会话累计。口径已归一化：`input` 不含缓存（Codex 的输入包含缓存，已减去），`output` 含推理。`lifetime` 在 Claude 来自 result 的 `modelUsage`（跨模型求和），在 Codex 来自实时通知或 rollout 的累计计数，Claude 会话恢复的首次补发没有累计值。`cacheWrite` 仅在使用 Anthropic 类提供商时才非零。
+
+Codex 只在实时轮次里上报用量，协议也没有查询当前用量的请求，因此恢复会话时，`harnessd` 从 `thread/read` 返回的 rollout 路径读取最后一条有效的 `token_count`，在 `replay_complete` 之后补发一条 `usage_update`。路径缺失或读取失败时，会话恢复照常进行，用量等下一轮再出现。
+
 实时 `session/update` 通知的 `params._meta["_harness/replayCursor"]` 携带续传游标。客户端保留已经应用的对话状态后，可把最后一个游标原样作为 `session/resume.replayFrom`，补收之后的事件。缓冲覆盖或进程重启后，旧游标返回 `-32602`，客户端可以用 `{"type":"start"}` 重新加载完整历史。
 
 ## 目录结构

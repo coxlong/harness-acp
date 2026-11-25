@@ -1,6 +1,8 @@
 package claude
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -156,6 +158,66 @@ func TestTaskToolsBuildOnePlan(t *testing.T) {
 	last, _ := plans[3].Plan.As[schema.PlanUpdateContentItems]()
 	if len(last.Entries) != 1 || last.Entries[0].Content != "Doing first" || last.Entries[0].Status != schema.PlanEntryStatusInProgress {
 		t.Errorf("final plan = %+v", last.Entries)
+	}
+}
+
+type usageRequestWriter func([]byte) (int, error)
+
+func (w usageRequestWriter) Write(line []byte) (int, error) { return w(line) }
+func (usageRequestWriter) Close() error                     { return nil }
+
+func TestRestoreUsage(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		startedWork bool
+	}{
+		{name: "resumed"},
+		{name: "foreground work completed during query", startedWork: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &proc{done: make(chan struct{})}
+			s := NewSession("id", &Runtime{procs: map[string]*proc{"id": p}}, SpawnOpts{})
+			p.stdin = usageRequestWriter(func(line []byte) (int, error) {
+				var request struct {
+					ID      string            `json:"request_id"`
+					Request map[string]string `json:"request"`
+				}
+				if err := json.Unmarshal(line, &request); err != nil {
+					t.Fatal(err)
+				}
+				if request.Request["subtype"] != "get_context_usage" || request.Request["detail"] != "summary" {
+					t.Fatalf("unexpected request: %s", line)
+				}
+				if tc.startedWork {
+					s.mu.Lock()
+					s.turn(backend.TurnRunning, "", nil)
+					s.turn(backend.TurnIdle, "", nil)
+					s.mu.Unlock()
+				}
+				s.handle(p, []byte(fmt.Sprintf(
+					`{"type":"control_response","response":{"subtype":"success","request_id":%q,"response":{"totalTokens":42000,"rawMaxTokens":200000}}}`,
+					request.ID,
+				)))
+				return len(line), nil
+			})
+
+			s.restoreUsage()
+			var found bool
+			for _, ev := range drain(s) {
+				if ev.Kind != backend.EventUpdate {
+					continue
+				}
+				if usage, ok := ev.Update.Variant().(schema.SessionUpdateUsageUpdate); ok {
+					found = true
+					if usage.Used != 42000 || usage.Size != 200000 {
+						t.Fatalf("unexpected usage: %+v", usage)
+					}
+				}
+			}
+			if found == tc.startedWork {
+				t.Fatalf("usage update emitted = %t, want %t", found, !tc.startedWork)
+			}
+		})
 	}
 }
 
@@ -321,5 +383,42 @@ func TestAvailableModes(t *testing.T) {
 	}
 	if got := ids(sessionConfig{model: "old"}); strings.Contains(got, "auto") {
 		t.Errorf("a model without Auto still offers it: %s", got)
+	}
+}
+
+// resultWithCounters is a result of a session that ran two models: each entry
+// carries that model's cumulative counters.
+const resultWithCounters = `{"type":"result","subtype":"success","is_error":false,"result":"done","stop_reason":"end_turn","terminal_reason":"completed","num_turns":1,"total_cost_usd":0.07,"modelUsage":{"claude-sonnet-5-5[1m]":{"contextWindow":1000000,"inputTokens":300,"outputTokens":40,"cacheReadInputTokens":130000,"cacheCreationInputTokens":2000},"claude-haiku-4-5[1m]":{"contextWindow":200000,"inputTokens":100,"outputTokens":10,"cacheReadInputTokens":5000,"cacheCreationInputTokens":0}}}`
+
+func TestUsageCarriesTheBreakdown(t *testing.T) {
+	us := updates(t, writeUse, resultWithCounters)
+	var last schema.SessionUpdateUsageUpdate
+	var found bool
+	for _, u := range us {
+		if v, ok := u.(schema.SessionUpdateUsageUpdate); ok {
+			last, found = v, true
+		}
+	}
+	if !found {
+		t.Fatal("no usage update")
+	}
+	if last.Used != 2+16295+8 || last.Size != 1_000_000 {
+		t.Fatalf("used/size = %d/%d", last.Used, last.Size)
+	}
+
+	var doc struct {
+		Context  backend.TokenBreakdown `json:"context"`
+		Lifetime backend.TokenBreakdown `json:"lifetime"`
+	}
+	if err := json.Unmarshal([]byte(last.Meta["_harness/tokens"]), &doc); err != nil {
+		t.Fatal(err)
+	}
+	// Claude's input excludes the cache, so it is reported as it stands.
+	if got := doc.Context; got.Input != 2 || got.Cached != 0 || got.CacheWrite != 16295 || got.Output != 8 {
+		t.Fatalf("unexpected context breakdown: %+v", got)
+	}
+	// A session that ran two models totals both of them.
+	if got := doc.Lifetime; got.Input != 400 || got.Cached != 135000 || got.CacheWrite != 2000 || got.Output != 50 {
+		t.Fatalf("unexpected lifetime breakdown: %+v", got)
 	}
 }

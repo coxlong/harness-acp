@@ -117,6 +117,7 @@ func (b *Backend) ResumeSession(ctx context.Context, id string, p backend.Resume
 		_ = s.Close(ctx)
 		return nil, err
 	}
+	go s.restoreUsage()
 	return s, nil
 }
 

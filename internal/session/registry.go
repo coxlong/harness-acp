@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/coxlong/harness-acp/internal/backend"
+	schema "github.com/ironpark/acp-go/schema/v2"
 )
 
 // ErrSessionNotFound is returned when a session ID is unknown.
@@ -30,6 +31,7 @@ type entry struct {
 	subSeq     uint64
 	closed     bool
 	state      backend.TurnEvent
+	usage      schema.SessionUpdateUsageUpdate
 	output     liveOutput
 }
 
@@ -57,6 +59,7 @@ type Subscription struct {
 	Replay      []Delivery
 	LiveOutput  []backend.HistoryUpdate
 	State       backend.TurnEvent
+	Usage       schema.SessionUpdateUsageUpdate
 	Cursor      Cursor
 	Unsubscribe func()
 }
@@ -170,6 +173,14 @@ func (r *Registry) pump(id string, e *entry) {
 		default:
 			e.next++
 			d.Cursor = Cursor{e.generation, e.next}
+			if ev.Kind == backend.EventUpdate && ev.Session == "" {
+				if usage, ok := ev.Update.Variant().(schema.SessionUpdateUsageUpdate); ok && usage.Size > 0 {
+					if usage.Cost.IsZero() {
+						usage.Cost = e.usage.Cost
+					}
+					e.usage = usage
+				}
+			}
 			e.buffer[(e.next-1)%uint64(len(e.buffer))] = d
 			if e.output != nil && ev.Kind == backend.EventUpdate {
 				e.output.observe(d)
@@ -256,7 +267,7 @@ func (r *Registry) Attach(id string, cursor *Cursor, canElicitForm, fromStart bo
 	e.subSeq++
 	e.subs[key] = sub
 	return Subscription{
-		Events: sub.events, Overflow: sub.overflow, Replay: replay, LiveOutput: output, State: e.state,
+		Events: sub.events, Overflow: sub.overflow, Replay: replay, LiveOutput: output, State: e.state, Usage: e.usage,
 		Cursor: Cursor{e.generation, e.next},
 		Unsubscribe: func() {
 			e.mu.Lock()

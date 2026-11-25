@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,8 @@ type Backend struct {
 	mu      sync.Mutex
 	process *process
 	closed  bool
+	// rollouts caches what each thread's rollout last said about its usage.
+	rollouts map[string]*rollout
 }
 
 var _ backend.Backend = (*Backend)(nil)
@@ -175,7 +178,35 @@ func (b *Backend) ResumeSession(ctx context.Context, id string, p backend.Resume
 	if err != nil {
 		return nil, err
 	}
-	return b.open(ctx, "thread/resume", params, mode)
+	handle, err := b.open(ctx, "thread/resume", params, mode)
+	if err != nil {
+		return nil, err
+	}
+	if s, ok := handle.(*Session); ok {
+		go b.restoreUsage(s, t.Path)
+	}
+	return handle, nil
+}
+
+// restoreUsage reports the usage the thread had when it last ran, so a client
+// that resumes it does not go without until the next model response. Codex
+// reports usage only to a live turn, and nothing in the protocol asks for it,
+// so the rollout is the only source.
+func (b *Backend) restoreUsage(s *Session, path string) {
+	usage, err := b.restoredUsage(s.id, path)
+	if err != nil {
+		// Not an error of the session: a rollout Codex moved or removed, and
+		// a thread that never ran, both leave the client without usage until
+		// the next turn reports it.
+		log.Printf("codex session %s: no recorded usage to restore: %v", s.id, err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.sawUsage || usage.ModelContextWindow == 0 || usage.Last.TotalTokens == 0 {
+		return
+	}
+	s.emit(usageEvent(usage))
 }
 
 func (b *Backend) open(ctx context.Context, method string, params object, mode string) (backend.SessionHandle, error) {

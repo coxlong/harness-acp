@@ -59,12 +59,50 @@ type notification struct {
 		Step   string `json:"step"`
 		Status string `json:"status"`
 	} `json:"plan"`
-	TokenUsage struct {
-		Last struct {
-			InputTokens uint64 `json:"inputTokens"`
-		} `json:"last"`
-		ModelContextWindow uint64 `json:"modelContextWindow"`
-	} `json:"tokenUsage"`
+	TokenUsage tokenUsage `json:"tokenUsage"`
+}
+
+// tokenUsage is one `thread/tokenUsage/updated`: the request's counters, the
+// thread's cumulative ones, and the window they run against.
+type tokenUsage struct {
+	Total              tokenCounters `json:"total"`
+	Last               tokenCounters `json:"last"`
+	ModelContextWindow uint64        `json:"modelContextWindow"`
+}
+
+// tokenCounters is one side of a report. InputTokens is the whole prompt, the
+// cache included, and OutputTokens the reply, reasoning included.
+type tokenCounters struct {
+	InputTokens           uint64 `json:"inputTokens"`
+	CachedInputTokens     uint64 `json:"cachedInputTokens"`
+	CacheWriteInputTokens uint64 `json:"cacheWriteInputTokens"`
+	OutputTokens          uint64 `json:"outputTokens"`
+	TotalTokens           uint64 `json:"totalTokens"`
+}
+
+// breakdown splits these counters the way usage metadata reports them.
+func (c tokenCounters) breakdown() backend.TokenBreakdown {
+	return backend.TokenBreakdown{
+		Input:      backend.FreshInput(c.InputTokens, c.CachedInputTokens, c.CacheWriteInputTokens),
+		Cached:     c.CachedInputTokens,
+		CacheWrite: c.CacheWriteInputTokens,
+		Output:     c.OutputTokens,
+	}
+}
+
+// usageEvent reports the context in use and its breakdown when available.
+func usageEvent(u tokenUsage) backend.Event {
+	breakdown, lifetime := u.Last.breakdown(), u.Total.breakdown()
+	var context *backend.TokenBreakdown
+	// Some reports carry only TotalTokens, such as after a settings change.
+	if breakdown.Input+breakdown.Cached+breakdown.CacheWrite+breakdown.Output == u.Last.TotalTokens {
+		context = &breakdown
+	}
+	return update(schema.SessionUpdateUsageUpdate{
+		Used: u.Last.TotalTokens,
+		Size: u.ModelContextWindow,
+		Meta: backend.TokenMeta(context, &lifetime),
+	})
 }
 
 type item struct {
@@ -164,8 +202,10 @@ func (s *Session) translate(method string, e notification) {
 			s.emit(update(schema.SessionUpdateSessionInfoUpdate{Title: optional.Of(e.ThreadName)}))
 		}
 	case "thread/tokenUsage/updated":
-		if size := e.TokenUsage.ModelContextWindow; size > 0 {
-			s.emit(update(schema.SessionUpdateUsageUpdate{Used: e.TokenUsage.Last.InputTokens, Size: size}))
+		u := e.TokenUsage
+		if u.ModelContextWindow > 0 && u.Last.TotalTokens > 0 {
+			s.sawUsage = true
+			s.emit(usageEvent(u))
 		}
 	}
 }

@@ -434,6 +434,12 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 		}
 	}
 
+	// Send usage before the cursor advances past the updates it summarizes.
+	if sub.Usage.Size > 0 {
+		if err := f.sendUpdate(ctx, params.SessionID, schema.NewSessionUpdate(sub.Usage)); err != nil {
+			return nil, err
+		}
+	}
 	// The snapshot tells the client whether a turn is open right now.
 	if err := f.snapshot(ctx, params.SessionID, sub.State, sub.Cursor); err != nil {
 		return nil, err

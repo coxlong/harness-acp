@@ -63,6 +63,9 @@ type Session struct {
 	terminals    map[string]terminalTask
 	watching     bool
 	terminalMu   sync.Mutex
+	// sawUsage: the live thread reported its usage, so a restored one would
+	// be older than what the client already has.
+	sawUsage bool
 }
 
 var _ backend.SessionHandle = (*Session)(nil)

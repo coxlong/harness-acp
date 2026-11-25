@@ -9,6 +9,7 @@ import (
 
 	"github.com/coxlong/harness-acp/internal/backend"
 	"github.com/ironpark/acp-go/acp2"
+	"github.com/ironpark/acp-go/schema/optional"
 	schema "github.com/ironpark/acp-go/schema/v2"
 )
 
@@ -148,5 +149,60 @@ func TestReplayCheckpointAndInteractionRecipient(t *testing.T) {
 	expired.Generation = "previous process"
 	if _, err := r.Attach("thread", &expired, true, false); !errors.Is(err, ErrReplayGap) {
 		t.Fatalf("wrong generation got %v", err)
+	}
+}
+
+func TestUsageSnapshotAtReplayCheckpoint(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	r := New(1)
+	h := &eventHandle{events: make(chan backend.Event, 4)}
+	r.Register("thread", "claude", h)
+	t.Cleanup(func() { _ = r.Remove(context.Background(), "thread") })
+	attach := func(fromStart bool) Subscription {
+		t.Helper()
+		sub, err := r.Attach("thread", nil, false, fromStart)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(sub.Unsubscribe)
+		return sub
+	}
+	first := attach(false)
+	read := func(sub Subscription) Delivery {
+		t.Helper()
+		select {
+		case d := <-sub.Events:
+			return d
+		case <-ctx.Done():
+			t.Fatal("update not delivered")
+			return Delivery{}
+		}
+	}
+	publish := func(child string, usage schema.SessionUpdateUsageUpdate) {
+		h.events <- backend.Event{
+			Kind: backend.EventUpdate, Session: child, Update: schema.NewSessionUpdate(usage),
+		}
+		read(first)
+	}
+
+	cost := schema.Cost{Amount: 1, Currency: "USD"}
+	publish("", schema.SessionUpdateUsageUpdate{Used: 60, Size: 100, Cost: optional.Of(cost)})
+	publish("", schema.SessionUpdateUsageUpdate{Used: 30, Size: 100})
+	publish("child", schema.SessionUpdateUsageUpdate{Used: 90, Size: 100})
+	resumed := attach(true)
+	if got, ok := resumed.Usage.Cost.Get(); !ok || got.Amount != cost.Amount || got.Currency != cost.Currency {
+		t.Fatalf("snapshot cost = %+v, present = %t", got, ok)
+	}
+	if resumed.Usage.Used != 30 || resumed.Usage.Size != 100 {
+		t.Fatalf("unexpected usage snapshot: %+v", resumed.Usage)
+	}
+	publish("", schema.SessionUpdateUsageUpdate{Used: 40, Size: 100, Cost: optional.Null[schema.Cost]()})
+	update := read(resumed)
+	if update.Cursor.Seq != resumed.Cursor.Seq+1 || update.Update.Variant().(schema.SessionUpdateUsageUpdate).Used != 40 {
+		t.Fatalf("unexpected live update after usage snapshot: %+v", update)
+	}
+	if next := attach(true); !next.Usage.Cost.IsNull() {
+		t.Fatalf("snapshot did not preserve the cost clear: %+v", next.Usage)
 	}
 }

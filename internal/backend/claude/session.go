@@ -43,6 +43,8 @@ type Session struct {
 	titling    bool               // a title request is out
 	reqSeq     atomic.Uint64
 
+	startedWork bool // foreground work has started on this handle
+
 	// ctl holds the control requests that wait for an answer.
 	ctlMu sync.Mutex
 	ctl   map[string]chan ctlReply
@@ -95,6 +97,9 @@ func (s *Session) send(ev backend.Event) {
 }
 
 func (s *Session) turn(state backend.TurnState, reason acp2.StopReason, err error) {
+	if state == backend.TurnRunning {
+		s.startedWork = true
+	}
 	s.send(backend.Event{Kind: backend.EventTurnState, Turn: backend.TurnEvent{
 		State: state, StopReason: reason, Err: err, Background: s.tr.backgroundWork(),
 	}})

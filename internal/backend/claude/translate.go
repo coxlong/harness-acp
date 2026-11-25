@@ -122,8 +122,15 @@ type resultMsg struct {
 	Errors         []string `json:"errors"`
 	NumTurns       int      `json:"num_turns"`
 	TotalCostUSD   *float64 `json:"total_cost_usd"`
-	ModelUsage     map[string]struct {
-		ContextWindow uint64 `json:"contextWindow"`
+	// ModelUsage carries the session's cumulative counters, one entry per
+	// model it ran. InputTokens excludes the cache, which is counted on its
+	// own; thinking is inside OutputTokens.
+	ModelUsage map[string]struct {
+		InputTokens              uint64 `json:"inputTokens"`
+		OutputTokens             uint64 `json:"outputTokens"`
+		CacheReadInputTokens     uint64 `json:"cacheReadInputTokens"`
+		CacheCreationInputTokens uint64 `json:"cacheCreationInputTokens"`
+		ContextWindow            uint64 `json:"contextWindow"`
 	} `json:"modelUsage"`
 	Origin *struct {
 		Kind string `json:"kind"`
