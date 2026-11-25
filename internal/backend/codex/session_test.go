@@ -208,3 +208,74 @@ func TestSecretQuestionDoesNotOpenForm(t *testing.T) {
 		t.Fatal("sensitive fields must not be requested over ACP form mode")
 	}
 }
+
+func TestCompletedAgentMessageEndsTheStream(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), rpcTimeout)
+	defer cancel()
+	p := &process{
+		done: make(chan struct{}), writes: make(chan []byte, 2),
+		pending: make(map[uint64]chan message), sessions: make(map[string]*Session),
+	}
+	s := newSession(p, threadResponse{Thread: thread{ID: "thread-1"}})
+	if _, err := p.put(s); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.end(nil) })
+
+	readEvent := func() backend.Event {
+		t.Helper()
+		select {
+		case event := <-s.Events():
+			return event
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for ACP event")
+			return backend.Event{}
+		}
+	}
+
+	for _, delta := range []string{"hel", "lo"} {
+		p.dispatch(message{
+			Method: "item/agentMessage/delta",
+			Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"msg-1","delta":"` + delta + `"}`),
+		})
+		chunk, ok := readEvent().Update.Variant().(schema.SessionUpdateAgentMessageChunk)
+		if !ok || chunk.MessageID != "msg-1" {
+			t.Fatalf("expected agent message chunk for msg-1, got %#v", chunk)
+		}
+	}
+
+	p.dispatch(message{
+		Method: "item/completed",
+		Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","item":{"id":"msg-1","type":"agentMessage","text":"hello"}}`),
+	})
+	done, ok := readEvent().Update.Variant().(schema.SessionUpdateAgentMessage)
+	if !ok {
+		t.Fatalf("expected a complete agent message, got %#v", done)
+	}
+	meta, ok := done.Meta.Get()
+	if !ok || string(meta["_harness/streamComplete"]) != "true" {
+		t.Fatalf("expected the stream completion marker, got %v", meta)
+	}
+	content, ok := done.Content.Get()
+	if done.MessageID != "msg-1" || !ok || len(content) != 1 {
+		t.Fatalf("unexpected complete message: %#v", done)
+	}
+	if text, ok := content[0].Variant().(schema.ContentBlockText); !ok || text.Text != "hello" {
+		t.Fatalf("unexpected complete message content: %#v", content)
+	}
+
+	p.dispatch(message{
+		Method: "item/agentMessage/delta",
+		Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"msg-2","delta":"keep this"}`),
+	})
+	readEvent()
+	p.dispatch(message{
+		Method: "item/completed",
+		Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","item":{"id":"msg-2","type":"agentMessage"}}`),
+	})
+	done, ok = readEvent().Update.Variant().(schema.SessionUpdateAgentMessage)
+	meta, _ = done.Meta.Get()
+	if !ok || done.MessageID != "msg-2" || !done.Content.IsZero() || string(meta["_harness/streamComplete"]) != "true" {
+		t.Fatalf("expected a completion marker that preserves streamed content, got %#v", done)
+	}
+}

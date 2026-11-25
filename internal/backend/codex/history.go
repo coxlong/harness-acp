@@ -51,7 +51,7 @@ func (r *historyReader) replay(ctx context.Context, t thread, sid string) error 
 		if i.Cwd == "" {
 			i.Cwd = t.Cwd
 		}
-		for _, ev := range i.events(true, false) {
+		for _, ev := range i.events(true, false, optional.Value[schema.Meta]{}) {
 			r.history.Updates = append(r.history.Updates, backend.HistoryUpdate{Session: sid, Update: ev.Update})
 		}
 		if i.SenderThreadID == "" || i.SenderThreadID == t.ID {

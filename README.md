@@ -47,6 +47,8 @@ cut -d= -f2- "${XDG_CONFIG_HOME:-$HOME/.config}/harnessd/token.env"
 
 Codex 的 `request_user_input` 会转成 ACP v2 表单。客户端须在初始化时声明 `capabilities.elicitation.form`。同一会话有多个连接时，表单只发给最近挂接且支持表单的客户端。
 
+Codex 实时结束一段回复或思考时，相应的 `agent_message` 或 `agent_thought` 更新包含 `_meta["_harness/streamComplete"]: true`。如果结束事件只确认了已流式传输的内容，更新会省略 `content`，客户端保留已接收的文本。
+
 实时 `session/update` 通知的 `params._meta["_harness/replayCursor"]` 携带续传游标。客户端保留已经应用的对话状态后，可把最后一个游标原样作为 `session/resume.replayFrom`，补收之后的事件。缓冲覆盖或进程重启后，旧游标返回 `-32602`，客户端可以用 `{"type":"start"}` 重新加载完整历史。
 
 ## 目录结构

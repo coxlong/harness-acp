@@ -126,7 +126,12 @@ func (s *Session) translate(method string, e notification) {
 		if e.Item.Cwd == "" {
 			e.Item.Cwd = s.cwd
 		}
-		for _, ev := range e.Item.events(final, s.deltaItems[e.Item.ID]) {
+		var streamEnd optional.Value[schema.Meta]
+		if final && (e.Item.Type == "agentMessage" || e.Item.Type == "reasoning") {
+			// An ACP upsert can also be a partial snapshot or a metadata patch.
+			streamEnd = optional.Of(schema.Meta{"_harness/streamComplete": jsontext.Value("true")})
+		}
+		for _, ev := range e.Item.events(final, s.deltaItems[e.Item.ID], streamEnd) {
 			s.emit(ev)
 		}
 		s.observeChildren(e.Item)
@@ -165,7 +170,7 @@ func (s *Session) translate(method string, e notification) {
 	}
 }
 
-func (i item) events(final, streamed bool) []backend.Event {
+func (i item) events(final, streamed bool, streamEnd optional.Value[schema.Meta]) []backend.Event {
 	if i.ID == "" {
 		return nil
 	}
@@ -179,10 +184,12 @@ func (i item) events(final, streamed bool) []backend.Event {
 			return []backend.Event{update(schema.SessionUpdateUserMessage{MessageID: messageID, Content: optional.Of(historyInput(i.Content))})}
 		}
 	case "agentMessage":
-		if final && (!streamed || i.Text != "") {
-			return []backend.Event{update(schema.SessionUpdateAgentMessage{
-				MessageID: messageID, Content: optional.Of([]acp2.ContentBlock{acp2.TextBlock(i.Text)}),
-			})}
+		if final {
+			message := schema.SessionUpdateAgentMessage{MessageID: messageID, Meta: streamEnd}
+			if !streamed || i.Text != "" {
+				message.Content = optional.Of([]acp2.ContentBlock{acp2.TextBlock(i.Text)})
+			}
+			return []backend.Event{update(message)}
 		}
 	case "reasoning":
 		if final {
@@ -191,8 +198,11 @@ func (i item) events(final, streamed bool) []backend.Event {
 			thought := strings.Join(append(i.Summary, details...), "\n")
 			if thought != "" {
 				return []backend.Event{update(schema.SessionUpdateAgentThought{
-					MessageID: messageID, Content: optional.Of([]acp2.ContentBlock{acp2.TextBlock(thought)}),
+					MessageID: messageID, Content: optional.Of([]acp2.ContentBlock{acp2.TextBlock(thought)}), Meta: streamEnd,
 				})}
+			}
+			if streamed {
+				return []backend.Event{update(schema.SessionUpdateAgentThought{MessageID: messageID, Meta: streamEnd})}
 			}
 		}
 	case "plan":
