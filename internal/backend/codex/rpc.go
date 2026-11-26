@@ -36,11 +36,12 @@ type rpcError struct {
 func (e *rpcError) Error() string { return fmt.Sprintf("Codex RPC %d: %s", e.Code, e.Message) }
 
 type process struct {
-	cancel context.CancelFunc
-	stdin  io.WriteCloser
-	done   chan struct{}
-	exited chan struct{}
-	writes chan []byte
+	cancel            context.CancelFunc
+	stdin             io.WriteCloser
+	done              chan struct{}
+	exited            chan struct{}
+	writes            chan []byte
+	permissionTimeout time.Duration
 
 	mu       sync.Mutex
 	nextID   uint64

@@ -30,7 +30,7 @@ func wiredInit(t *testing.T, be backend.Backend) (*acp2.ClientSideConnection, *a
 	ctx := context.Background()
 	_, client := acp2.Pipe(ctx,
 		func(c *acp2.AgentSideConnection) acp2.Agent {
-			return NewFacade("claude", be, session.New(10), nil, c)
+			return NewFacade("claude", be, session.New(), nil, c)
 		},
 		func(*acp2.ClientSideConnection) acp2.Client { return newRecorder() },
 	)

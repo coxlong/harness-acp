@@ -62,7 +62,7 @@ func (f *Facade) ForkSession(ctx context.Context, req *acp2.ForkSessionRequest) 
 	}
 	id := h.NativeID()
 	f.reg.Register(id, f.name, h)
-	_, start, err := f.attach(id, nil, false)
+	_, start, err := f.attach(id, false)
 	if err != nil {
 		return nil, err
 	}

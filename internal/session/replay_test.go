@@ -3,7 +3,6 @@ package session
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"testing"
 	"time"
 
@@ -18,14 +17,20 @@ type eventHandle struct {
 	events chan backend.Event
 }
 
+func (h *eventHandle) Events() <-chan backend.Event { return h.events }
+func (h *eventHandle) Close(context.Context) error {
+	close(h.events)
+	return nil
+}
+
 func TestReplayIncludesLiveOutputAtItsOwnCheckpoint(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	r := New(1)
+	r := New()
 	h := &eventHandle{events: make(chan backend.Event, 4)}
 	r.Register("thread", "codex", h)
 	t.Cleanup(func() { _ = r.Remove(context.Background(), "thread") })
-	first, err := r.Attach("thread", nil, false, false)
+	first, err := r.Attach("thread", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +50,7 @@ func TestReplayIncludesLiveOutputAtItsOwnCheckpoint(t *testing.T) {
 	publish("", schema.NewSessionUpdate(schema.SessionUpdateTerminalOutputChunk{
 		TerminalID: "terminal", Data: base64.StdEncoding.EncodeToString([]byte{0x00, 0x01}),
 	}))
-	resumed, err := r.Attach("thread", nil, false, true)
+	resumed, err := r.Attach("thread", false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +72,7 @@ func TestReplayIncludesLiveOutputAtItsOwnCheckpoint(t *testing.T) {
 	}
 	select {
 	case next := <-resumed.Events:
-		if next.Cursor.Seq != resumed.Cursor.Seq+1 || next.Session != "worker" {
+		if next.Session != "worker" {
 			t.Fatalf("unexpected live update: %+v", next)
 		}
 	case <-ctx.Done():
@@ -75,53 +80,41 @@ func TestReplayIncludesLiveOutputAtItsOwnCheckpoint(t *testing.T) {
 	}
 }
 
-func (h *eventHandle) Events() <-chan backend.Event { return h.events }
-func (h *eventHandle) Close(context.Context) error {
-	close(h.events)
-	return nil
-}
-
-func TestReplayCheckpointAndInteractionRecipient(t *testing.T) {
+func TestInteractionRoutedToLatestCapableSubscriber(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	r := New(2)
+	r := New()
 	h := &eventHandle{events: make(chan backend.Event, 10)}
 	r.Register("thread", "codex", h)
 	t.Cleanup(func() { _ = r.Remove(context.Background(), "thread") })
-	attach := func(cursor *Cursor, form bool) Subscription {
+	attach := func(form bool) Subscription {
 		t.Helper()
-		s, err := r.Attach("thread", cursor, form, false)
+		s, err := r.Attach("thread", form, false)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(s.Unsubscribe)
 		return s
 	}
-	read := func(s Subscription) Delivery {
+	read := func(s Subscription) backend.Event {
 		t.Helper()
 		select {
 		case d := <-s.Events:
 			return d
 		case <-ctx.Done():
 			t.Fatal("update not delivered")
-			return Delivery{}
+			return backend.Event{}
 		}
 	}
 
-	first := attach(nil, true)
-	second := attach(nil, true)
-	h.events <- backend.Event{Kind: backend.EventTurnState}
-	checkpoint := read(first).Cursor
-	if checkpoint.Seq != 1 || checkpoint.Generation == "" {
-		t.Fatalf("invalid first checkpoint: %+v", checkpoint)
-	}
-	_ = read(second)
-	third := attach(nil, false)
+	first := attach(true)
+	second := attach(true)
+	third := attach(false)
 	h.events <- backend.Event{Kind: backend.EventElicitation, Elicitation: &backend.Elicitation{
 		Context: ctx, Reply: func(*acp2.CreateElicitationResponse) {},
 	}}
-	if got := read(second); got.Kind != backend.EventElicitation || got.Cursor.Generation != "" {
-		t.Fatalf("live interaction got a replay cursor: %+v", got)
+	if got := read(second); got.Kind != backend.EventElicitation {
+		t.Fatalf("expected elicitation on second subscriber, got %+v", got)
 	}
 	select {
 	case d := <-first.Events:
@@ -130,38 +123,18 @@ func TestReplayCheckpointAndInteractionRecipient(t *testing.T) {
 		t.Fatalf("client without form support received request: %+v", d)
 	default:
 	}
-	first.Unsubscribe()
-	h.events <- backend.Event{Kind: backend.EventTurnState, Turn: backend.TurnEvent{State: backend.TurnRunning}}
-	_ = read(third)
-	h.events <- backend.Event{Kind: backend.EventTurnState, Turn: backend.TurnEvent{State: backend.TurnIdle}}
-	_ = read(third)
-
-	resumed := attach(&checkpoint, true)
-	if len(resumed.Replay) != 2 || resumed.Replay[0].Cursor.Seq != 2 || resumed.Replay[1].Cursor.Seq != 3 {
-		t.Fatalf("unexpected replay: %+v", resumed.Replay)
-	}
-	expired := checkpoint
-	expired.Seq = 0
-	if _, err := r.Attach("thread", &expired, true, false); !errors.Is(err, ErrReplayGap) {
-		t.Fatalf("old position got %v", err)
-	}
-	expired = checkpoint
-	expired.Generation = "previous process"
-	if _, err := r.Attach("thread", &expired, true, false); !errors.Is(err, ErrReplayGap) {
-		t.Fatalf("wrong generation got %v", err)
-	}
 }
 
-func TestUsageSnapshotAtReplayCheckpoint(t *testing.T) {
+func TestUsageSnapshotAtAttach(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	r := New(1)
+	r := New()
 	h := &eventHandle{events: make(chan backend.Event, 4)}
 	r.Register("thread", "claude", h)
 	t.Cleanup(func() { _ = r.Remove(context.Background(), "thread") })
 	attach := func(fromStart bool) Subscription {
 		t.Helper()
-		sub, err := r.Attach("thread", nil, false, fromStart)
+		sub, err := r.Attach("thread", false, fromStart)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,14 +142,14 @@ func TestUsageSnapshotAtReplayCheckpoint(t *testing.T) {
 		return sub
 	}
 	first := attach(false)
-	read := func(sub Subscription) Delivery {
+	read := func(sub Subscription) backend.Event {
 		t.Helper()
 		select {
 		case d := <-sub.Events:
 			return d
 		case <-ctx.Done():
 			t.Fatal("update not delivered")
-			return Delivery{}
+			return backend.Event{}
 		}
 	}
 	publish := func(child string, usage schema.SessionUpdateUsageUpdate) {
@@ -199,7 +172,7 @@ func TestUsageSnapshotAtReplayCheckpoint(t *testing.T) {
 	}
 	publish("", schema.SessionUpdateUsageUpdate{Used: 40, Size: 100, Cost: optional.Null[schema.Cost]()})
 	update := read(resumed)
-	if update.Cursor.Seq != resumed.Cursor.Seq+1 || update.Update.Variant().(schema.SessionUpdateUsageUpdate).Used != 40 {
+	if update.Update.Variant().(schema.SessionUpdateUsageUpdate).Used != 40 {
 		t.Fatalf("unexpected live update after usage snapshot: %+v", update)
 	}
 	if next := attach(true); !next.Usage.Cost.IsNull() {

@@ -146,7 +146,7 @@ func newStack(t *testing.T) *stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &stack{be: be, reg: session.New(100), dir: dir}
+	return &stack{be: be, reg: session.New(), dir: dir}
 }
 
 // connect opens one client connection to the shared registry/backend, as a

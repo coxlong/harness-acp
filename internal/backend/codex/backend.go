@@ -18,9 +18,10 @@ import (
 )
 
 type Backend struct {
-	ctx       context.Context
-	binary    string
-	allowDirs []string
+	ctx               context.Context
+	binary            string
+	allowDirs         []string
+	permissionTimeout time.Duration
 
 	mu      sync.Mutex
 	process *process
@@ -31,8 +32,8 @@ type Backend struct {
 
 var _ backend.Backend = (*Backend)(nil)
 
-func New(ctx context.Context, binary string, allowDirs []string) *Backend {
-	return &Backend{ctx: ctx, binary: binary, allowDirs: allowDirs}
+func New(ctx context.Context, binary string, allowDirs []string, permissionTimeout time.Duration) *Backend {
+	return &Backend{ctx: ctx, binary: binary, allowDirs: allowDirs, permissionTimeout: permissionTimeout}
 }
 
 func (b *Backend) Name() string { return "codex" }
@@ -69,6 +70,7 @@ func (b *Backend) connect(ctx context.Context) (*process, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start Codex app-server: %w", err)
 	}
+	p.permissionTimeout = b.permissionTimeout
 	init := object{
 		"clientInfo":   object{"name": "harnessd", "title": "Harness", "version": version.Version},
 		"capabilities": object{"experimentalApi": true},

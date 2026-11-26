@@ -117,7 +117,7 @@ func (f *Facade) NewSession(ctx context.Context, params *acp2.NewSessionRequest)
 	}
 	id := handle.NativeID()
 	f.reg.Register(id, f.name, handle)
-	_, start, err := f.attach(id, nil, false)
+	_, start, err := f.attach(id, false)
 	if err != nil {
 		return nil, err
 	}
@@ -275,9 +275,8 @@ func parseOffsetCursor(c string) (int, bool) {
 	return n, true
 }
 
-// ResumeSession attaches this connection to a session, replaying history if
-// asked: `start` from the backend's own record, `_harness/seq` from the
-// in-memory ring buffer of what this process already sent.
+// ResumeSession attaches this connection to a session, replaying full history
+// from the backend when replayFrom is `start`.
 //
 // Order on the wire: replayed updates, replay_complete, the state snapshot,
 // then live updates. The subscription is taken before the replay is read, so
@@ -288,6 +287,9 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 	if err != nil {
 		return nil, err
 	}
+	_, fromStart := params.ReplayFrom.Variant().(schema.ReplayFromStart)
+	validReplay := params.ReplayFrom.IsZero() || fromStart
+
 	unlock, err := f.reg.LockLifecycle(ctx, id)
 	if err != nil {
 		return nil, err
@@ -303,9 +305,9 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 		for _, dir := range params.AdditionalDirectories {
 			dirs = append(dirs, string(dir))
 		}
-		setup := initial
-		if _, start := params.ReplayFrom.Variant().(schema.ReplayFromStart); !start && !params.ReplayFrom.IsZero() {
-			setup = nil
+		var setup []backend.ConfigSelection
+		if validReplay {
+			setup = initial
 		}
 		handle, err := f.be.ResumeSession(ctx, id, backend.ResumeParams{Cwd: cwd, AdditionalDirectories: dirs, Config: setup})
 		if err != nil {
@@ -314,29 +316,12 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 		}
 		f.reg.Register(id, f.name, handle)
 	}
-
-	var cursor *session.Cursor
-	fromStart := false
-	if !params.ReplayFrom.IsZero() {
-		switch v := params.ReplayFrom.Variant().(type) {
-		case schema.ReplayFromStart:
-			fromStart = true
-		case schema.ReplayFromCustom:
-			value, ok := parseHarnessCursor(v)
-			if !ok {
-				return nil, acp.InvalidParams(fmt.Sprintf("unrecognised replayFrom cursor %q", v.Type))
-			}
-			cursor = &value
-		default:
-			return nil, acp.InvalidParams("unsupported replay cursor")
-		}
+	if !validReplay {
+		return nil, acp.InvalidParams("unsupported replay cursor")
 	}
 
-	sub, start, err := f.attach(id, cursor, fromStart)
+	sub, start, err := f.attach(id, fromStart)
 	if err != nil {
-		if errors.Is(err, session.ErrReplayGap) {
-			return nil, acp.InvalidParams(err.Error())
-		}
 		return nil, err
 	}
 	// Live events stay queued in the subscription until start() runs. A resume
@@ -358,53 +343,44 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 		}
 	}
 
-	if fromStart || cursor != nil {
+	if fromStart {
 		sid := params.SessionID
-		var hist backend.History
-		if fromStart {
-			var err error
-			hist, err = f.be.History(ctx, id)
-			if err != nil {
-				return nil, backendError(err, "replay history")
-			}
-			children := make(map[string]bool, len(hist.Children))
-			for _, child := range hist.Children {
-				children[child.ID] = true
-			}
-			for _, u := range sub.LiveOutput {
-				if u.Session == "" || children[u.Session] {
-					hist.Updates = append(hist.Updates, u)
-				}
-			}
-			for _, u := range hist.Updates {
-				target := sid
-				if u.Session != "" {
-					target = acp2.SessionID(u.Session)
-				}
-				if err := f.sendUpdate(ctx, target, u.Update); err != nil {
-					return nil, err
-				}
-			}
-			// Every child's end goes out on its parent before the replay ends, then
-			// each child's own replay is complete: deeper children first.
-			for i := len(hist.Children) - 1; i >= 0; i-- {
-				c := hist.Children[i]
-				if err := f.subagentState(ctx, sid, c, false); err != nil {
-					return nil, err
-				}
-			}
-			for _, c := range hist.Children {
-				if err := acp2.NewSessionStream(f.conn, acp2.SessionID(c.ID)).ReplayComplete(ctx); err != nil {
-					return nil, err
-				}
+		hist, err := f.be.History(ctx, id)
+		if err != nil {
+			return nil, backendError(err, "replay history")
+		}
+		children := make(map[string]bool, len(hist.Children))
+		for _, child := range hist.Children {
+			children[child.ID] = true
+		}
+		for _, u := range sub.LiveOutput {
+			if u.Session == "" || children[u.Session] {
+				hist.Updates = append(hist.Updates, u)
 			}
 		}
-		for _, ev := range sub.Replay {
-			if err := f.emit(ctx, sid, ev); err != nil {
+		for _, u := range hist.Updates {
+			target := sid
+			if u.Session != "" {
+				target = acp2.SessionID(u.Session)
+			}
+			if err := f.sendUpdate(ctx, target, u.Update); err != nil {
 				return nil, err
 			}
 		}
-		// replay_complete once per request with replayFrom, empty history too.
+		// Every child's end goes out on its parent before the replay ends, then
+		// each child's own replay is complete: deeper children first.
+		for i := len(hist.Children) - 1; i >= 0; i-- {
+			c := hist.Children[i]
+			if err := f.subagentState(ctx, sid, c, false); err != nil {
+				return nil, err
+			}
+		}
+		for _, c := range hist.Children {
+			if err := acp2.NewSessionStream(f.conn, acp2.SessionID(c.ID)).ReplayComplete(ctx); err != nil {
+				return nil, err
+			}
+		}
+		// replay_complete once per request with replayFrom:start, empty history too.
 		if err := acp2.NewSessionStream(f.conn, sid).ReplayComplete(ctx); err != nil {
 			return nil, err
 		}
@@ -434,14 +410,13 @@ func (f *Facade) ResumeSession(ctx context.Context, params *acp2.ResumeSessionRe
 		}
 	}
 
-	// Send usage before the cursor advances past the updates it summarizes.
 	if sub.Usage.Size > 0 {
 		if err := f.sendUpdate(ctx, params.SessionID, schema.NewSessionUpdate(sub.Usage)); err != nil {
 			return nil, err
 		}
 	}
 	// The snapshot tells the client whether a turn is open right now.
-	if err := f.snapshot(ctx, params.SessionID, sub.State, sub.Cursor); err != nil {
+	if err := f.snapshot(ctx, params.SessionID, sub.State); err != nil {
 		return nil, err
 	}
 	resumed = true
@@ -678,14 +653,13 @@ func (f *Facade) Prompt(ctx context.Context, params *acp2.PromptRequest) (*acp2.
 
 // --- subscription -----------------------------------------------------------
 
-// attach subscribes this connection to the session and returns what to send
-// before live events: the ring-buffer replay (when afterSeq is set), the
-// session's current state, and a start func that begins forwarding live
-// events. Attaching twice replaces the earlier subscription.
-func (f *Facade) attach(id string, cursor *session.Cursor, fromStart bool) (*subscription, func(), error) {
+// attach subscribes this connection to the session and returns its current
+// state snapshot and a start func that begins forwarding live events.
+// Attaching twice replaces the earlier subscription.
+func (f *Facade) attach(id string, fromStart bool) (*subscription, func(), error) {
 	caps := f.conn.ClientCapabilities()
 	form := caps != nil && caps.Elicitation != nil && caps.Elicitation.Form != nil
-	attached, err := f.reg.Attach(id, cursor, form, fromStart)
+	attached, err := f.reg.Attach(id, form, fromStart)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -742,7 +716,7 @@ func (f *Facade) forward(id acp2.SessionID, sub *subscription) {
 
 	stream := acp2.NewSessionStream(f.conn, id)
 	for {
-		var ev session.Delivery
+		var ev backend.Event
 		select {
 		case <-ctx.Done():
 			return
@@ -774,7 +748,7 @@ func (f *Facade) forward(id acp2.SessionID, sub *subscription) {
 
 // emit sends one non-permission event, to the session it belongs to: a child
 // session's events go to the child.
-func (f *Facade) emit(ctx context.Context, id acp2.SessionID, ev session.Delivery) error {
+func (f *Facade) emit(ctx context.Context, id acp2.SessionID, ev backend.Event) error {
 	if ev.Session != "" {
 		id = acp2.SessionID(ev.Session)
 	}
@@ -790,9 +764,7 @@ func (f *Facade) emit(ctx context.Context, id acp2.SessionID, ev session.Deliver
 	default:
 		return nil
 	}
-	return f.conn.SessionUpdate(ctx, &acp2.UpdateSessionNotification{
-		SessionID: id, Update: update, Meta: cursorMeta(ev.Cursor),
-	})
+	return f.sendUpdate(ctx, id, update)
 }
 
 func (f *Facade) elicit(ctx context.Context, request *backend.Elicitation) {
@@ -855,11 +827,9 @@ func idleUpdate(t backend.TurnEvent) schema.IdleStateUpdate {
 
 // snapshot reports the foreground state a resuming client joins in the middle
 // of. An idle snapshot carries no stop reason: it is not a new completion.
-func (f *Facade) snapshot(ctx context.Context, id acp2.SessionID, state backend.TurnEvent, cursor session.Cursor) error {
+func (f *Facade) snapshot(ctx context.Context, id acp2.SessionID, state backend.TurnEvent) error {
 	state.StopReason, state.Err = "", nil
-	return f.emit(ctx, id, session.Delivery{
-		Event: backend.Event{Kind: backend.EventTurnState, Turn: state}, Cursor: cursor,
-	})
+	return f.emit(ctx, id, backend.Event{Kind: backend.EventTurnState, Turn: state})
 }
 
 func (f *Facade) sendUpdate(ctx context.Context, id acp2.SessionID, u acp2.SessionUpdate) error {
@@ -898,32 +868,4 @@ func (f *Facade) askPermission(ctx context.Context, stream *acp2.SessionStream, 
 	if err := handle.Respond(p.ReqID, backend.Decision{Allow: allowed}); err != nil {
 		log.Printf("session %s: answering permission %s: %v", id, p.ReqID, err)
 	}
-}
-
-// --- helpers ----------------------------------------------------------------
-
-const replayCursorType = "_harness/seq"
-
-func cursorMeta(cursor session.Cursor) schema.Meta {
-	var meta schema.Meta
-	_ = meta.Set("_harness/replayCursor", struct {
-		Type string `json:"type"`
-		session.Cursor
-	}{replayCursorType, cursor})
-	return meta
-}
-
-func parseHarnessCursor(c schema.ReplayFromCustom) (session.Cursor, bool) {
-	var cursor session.Cursor
-	if c.Type != replayCursorType {
-		return cursor, false
-	}
-	if json.Unmarshal(c.AdditionalProperties["generation"], &cursor.Generation) != nil || cursor.Generation == "" {
-		return cursor, false
-	}
-	seq := c.AdditionalProperties["seq"]
-	if len(seq) == 0 || string(seq) == "null" || json.Unmarshal(seq, &cursor.Seq) != nil {
-		return cursor, false
-	}
-	return cursor, true
 }

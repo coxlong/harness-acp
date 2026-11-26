@@ -44,7 +44,7 @@ func TestListSessionsWire(t *testing.T) {
 	ctx := context.Background()
 	_, client := acp2.Pipe(ctx,
 		func(c *acp2.AgentSideConnection) acp2.Agent {
-			return NewFacade("claude", fakeLister{all: all}, session.New(10), nil, c)
+			return NewFacade("claude", fakeLister{all: all}, session.New(), nil, c)
 		},
 		func(*acp2.ClientSideConnection) acp2.Client { return newRecorder() },
 	)

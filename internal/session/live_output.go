@@ -31,72 +31,85 @@ type outputBuffer struct {
 	bytes []byte
 }
 
-// Live output can start before Codex records the corresponding item.
-// Keep it at the same checkpoint as the registry's subscription cursor.
-type liveOutput map[outputKey]*outputBuffer
+// liveOutput captures in-flight streaming output that has not yet been
+// persisted by Codex, so a cold replayFrom:start on an active session does not
+// miss the current partial message, thought, or terminal chunk.
+type liveOutput struct {
+	seq     uint64
+	streams map[outputKey]*outputBuffer
+}
 
-func (out liveOutput) observe(ev Delivery) {
+func newLiveOutput() *liveOutput {
+	return &liveOutput{streams: make(map[outputKey]*outputBuffer)}
+}
+
+func (out *liveOutput) observe(ev backend.Event) {
+	if out == nil || ev.Kind != backend.EventUpdate {
+		return
+	}
+	out.seq++
+	seq := out.seq
 	key := outputKey{session: ev.Session}
 	switch u := ev.Update.Variant().(type) {
 	case schema.SessionUpdateAgentMessageChunk:
 		key.id = string(u.MessageID)
 		if text, ok := u.Content.Variant().(schema.ContentBlockText); ok {
-			out.append(key, ev.Cursor.Seq, []byte(text.Text))
+			out.append(key, seq, []byte(text.Text))
 		}
 	case schema.SessionUpdateAgentThoughtChunk:
 		key.id, key.kind = string(u.MessageID), thoughtOutput
 		if text, ok := u.Content.Variant().(schema.ContentBlockText); ok {
-			out.append(key, ev.Cursor.Seq, []byte(text.Text))
+			out.append(key, seq, []byte(text.Text))
 		}
 	case schema.SessionUpdateAgentMessage:
 		if !u.Content.IsZero() {
 			key.id = string(u.MessageID)
-			delete(out, key)
+			delete(out.streams, key)
 		}
 	case schema.SessionUpdateAgentThought:
 		if !u.Content.IsZero() {
 			key.id, key.kind = string(u.MessageID), thoughtOutput
-			delete(out, key)
+			delete(out.streams, key)
 		}
 	case schema.SessionUpdateTerminalOutputChunk:
 		key.id, key.kind = string(u.TerminalID), terminalOutput
 		if data, err := base64.StdEncoding.DecodeString(u.Data); err == nil {
-			out.append(key, ev.Cursor.Seq, data)
+			out.append(key, seq, data)
 		}
 	case schema.SessionUpdateTerminalUpdate:
 		if u.Output.IsZero() {
 			return
 		}
 		key.id, key.kind = string(u.TerminalID), terminalOutput
-		delete(out, key)
+		delete(out.streams, key)
 		if output, ok := u.Output.Get(); ok {
 			if data, err := base64.StdEncoding.DecodeString(output.Data); err == nil {
-				out.append(key, ev.Cursor.Seq, data)
+				out.append(key, seq, data)
 			}
 		}
 	}
 }
 
-func (out liveOutput) append(key outputKey, sequence uint64, data []byte) {
+func (out *liveOutput) append(key outputKey, sequence uint64, data []byte) {
 	if len(data) == 0 {
 		return
 	}
 	const maxStreams = 32
 	const maxStreamBytes = 1 << 20
-	buffer := out[key]
+	buffer := out.streams[key]
 	if buffer == nil {
-		if len(out) >= maxStreams {
+		if len(out.streams) >= maxStreams {
 			var oldest outputKey
 			oldestSeq := sequence
-			for k, b := range out {
+			for k, b := range out.streams {
 				if b.last < oldestSeq {
 					oldest, oldestSeq = k, b.last
 				}
 			}
-			delete(out, oldest)
+			delete(out.streams, oldest)
 		}
 		buffer = &outputBuffer{first: sequence}
-		out[key] = buffer
+		out.streams[key] = buffer
 	}
 	buffer.last = sequence
 	if len(data) >= maxStreamBytes {
@@ -110,15 +123,18 @@ func (out liveOutput) append(key outputKey, sequence uint64, data []byte) {
 	buffer.bytes = append(buffer.bytes, data...)
 }
 
-func (out liveOutput) snapshot() []backend.HistoryUpdate {
-	keys := make([]outputKey, 0, len(out))
-	for key := range out {
+func (out *liveOutput) snapshot() []backend.HistoryUpdate {
+	if out == nil || len(out.streams) == 0 {
+		return nil
+	}
+	keys := make([]outputKey, 0, len(out.streams))
+	for key := range out.streams {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool { return out[keys[i]].first < out[keys[j]].first })
+	sort.Slice(keys, func(i, j int) bool { return out.streams[keys[i]].first < out.streams[keys[j]].first })
 	updates := make([]backend.HistoryUpdate, 0, len(keys))
 	for _, key := range keys {
-		data := out[key].bytes
+		data := out.streams[key].bytes
 		var snapshot acp2.SessionUpdate
 		if key.kind == terminalOutput {
 			snapshot = schema.NewSessionUpdate(schema.SessionUpdateTerminalUpdate{

@@ -5,26 +5,26 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"time"
 
 	acp "github.com/ironpark/acp-go"
 	"github.com/ironpark/acp-go/acp2"
-	"github.com/ironpark/acp-go/acphttp"
 
 	"github.com/coxlong/harness-acp/internal/backend"
 	"github.com/coxlong/harness-acp/internal/config"
 	"github.com/coxlong/harness-acp/internal/registry"
+	"github.com/coxlong/harness-acp/internal/rws"
 	"github.com/coxlong/harness-acp/internal/session"
 	"github.com/coxlong/harness-acp/internal/version"
 )
 
 // Server wires the HTTP mux together.
 type Server struct {
-	mux      *http.ServeMux
-	backends map[string]backend.Backend
-	reg      *session.Registry
-	cfg      config.Config
-	agentReg *registry.Registry
+	mux       *http.ServeMux
+	backends  map[string]backend.Backend
+	reg       *session.Registry
+	cfg       config.Config
+	agentReg  *registry.Registry
+	endpoints []*rws.Server
 }
 
 // NewServer builds a Server and registers all routes.
@@ -44,24 +44,44 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// Close terminates all active and offline reliable WebSocket connections.
+func (s *Server) Close() error {
+	for _, ep := range s.endpoints {
+		_ = ep.Close()
+	}
+	return nil
+}
+
+// Shutdown closes all reliable WebSocket endpoints and waits for active ACP
+// handlers to finish or ctx to expire.
+func (s *Server) Shutdown(ctx context.Context) error {
+	var firstErr error
+	for _, ep := range s.endpoints {
+		if err := ep.Shutdown(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 func (s *Server) setup() {
 	// Discovery endpoint — also protected by auth.
 	s.mux.Handle("GET /v1/agents", authMiddleware(s.cfg.Token,
 		http.HandlerFunc(s.handleDiscover)))
 
-	// One ACP v2 endpoint per backend.
+	// One ACP v2 reliable WebSocket endpoint per backend.
 	for name, be := range s.backends {
-		name := name // capture
+		name := name
 		be := be
 
 		agentCfg := s.agentConfig(name)
 		reg := s.reg
 		if len(s.backends) > 1 {
 			// Native IDs and subscriptions belong to their agent endpoint.
-			reg = session.New(s.cfg.Session.ReplayBufSize)
+			reg = session.New()
 		}
 
-		srv := acphttp.NewServer(
+		srv := rws.NewServer(
 			func(ctx context.Context, t acp.Transport) error {
 				conn := acp2.NewAgentSideConnection(
 					func(c *acp2.AgentSideConnection) acp2.Agent {
@@ -71,13 +91,15 @@ func (s *Server) setup() {
 				)
 				return conn.Start(ctx)
 			},
-			acphttp.WithWebSocketOrigins(s.wsOrigins()...),
-			acphttp.WithWebSocketPing(15*time.Second),
-			acphttp.WithIdleTimeout(5*time.Minute),
+			rws.WithOrigins(s.wsOrigins()...),
+			rws.WithDisconnectTTL(s.cfg.Transport.DisconnectTTL),
+			rws.WithMaxBufferBytes(s.cfg.Transport.MaxBufferBytes),
+			rws.WithMaxOfflineConns(s.cfg.Transport.MaxOfflineConns),
 		)
+		s.endpoints = append(s.endpoints, srv)
 
 		s.mux.Handle("/acp/"+name, authMiddleware(s.cfg.Token, srv))
-		log.Printf("registered ACP endpoint /acp/%s", name)
+		log.Printf("registered ACP endpoint /acp/%s (disconnect TTL=%s)", name, s.cfg.Transport.DisconnectTTL)
 	}
 }
 

@@ -23,7 +23,7 @@ func discoveryServer(t *testing.T, cfg config.Config, agents ...registry.AgentIn
 	for _, info := range agents {
 		reg.Register(info)
 	}
-	return NewServer(cfg, map[string]backend.Backend{}, session.New(16), reg)
+	return NewServer(cfg, map[string]backend.Backend{}, session.New(), reg)
 }
 
 func getDiscovery(t *testing.T, h http.Handler, token string) *httptest.ResponseRecorder {

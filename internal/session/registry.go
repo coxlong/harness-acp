@@ -2,7 +2,6 @@ package session
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"sync"
 
@@ -16,37 +15,22 @@ var ErrSessionNotFound = errors.New("session not found")
 // ErrTurnConflict is returned when a concurrent turn is already running.
 var ErrTurnConflict = errors.New("turn already in progress")
 
-// entry holds live state for one session.
+// entry holds live state for one active session.
 type entry struct {
 	mu        sync.Mutex
 	handle    backend.SessionHandle
 	agentName string
 
-	// The cursor generation belongs to this in-memory session, not the
-	// persisted backend ID, which remains the same across restarts.
-	generation string
-	buffer     []Delivery
-	next       uint64
-	subs       map[uint64]*subscriber
-	subSeq     uint64
-	closed     bool
-	state      backend.TurnEvent
-	usage      schema.SessionUpdateUsageUpdate
-	output     liveOutput
-}
-
-type Cursor struct {
-	Generation string `json:"generation"`
-	Seq        uint64 `json:"seq"` // index of the next event to replay
-}
-
-type Delivery struct {
-	backend.Event
-	Cursor Cursor
+	subs   map[uint64]*subscriber
+	subSeq uint64
+	closed bool
+	state  backend.TurnEvent
+	usage  schema.SessionUpdateUsageUpdate
+	output *liveOutput
 }
 
 type subscriber struct {
-	events        chan Delivery
+	events        chan backend.Event
 	overflow      chan struct{}
 	canElicitForm bool
 	ctx           context.Context
@@ -54,21 +38,18 @@ type subscriber struct {
 }
 
 type Subscription struct {
-	Events      <-chan Delivery
+	Events      <-chan backend.Event
 	Overflow    <-chan struct{}
-	Replay      []Delivery
 	LiveOutput  []backend.HistoryUpdate
 	State       backend.TurnEvent
 	Usage       schema.SessionUpdateUsageUpdate
-	Cursor      Cursor
 	Unsubscribe func()
 }
 
-// Registry holds all active sessions.
+// Registry holds all active sessions for one backend endpoint.
 type Registry struct {
 	mu        sync.RWMutex
 	sessions  map[string]*entry
-	bufCap    int
 	lifecycle map[string]*lifecycleLock
 }
 
@@ -77,14 +58,10 @@ type lifecycleLock struct {
 	users int
 }
 
-// New creates a Registry with the given ring buffer capacity.
-func New(bufCap int) *Registry {
-	if bufCap <= 0 {
-		bufCap = 500
-	}
+// New creates a session Registry.
+func New() *Registry {
 	return &Registry{
 		sessions:  make(map[string]*entry),
-		bufCap:    bufCap,
 		lifecycle: make(map[string]*lifecycleLock),
 	}
 }
@@ -124,11 +101,11 @@ func (r *Registry) LockLifecycle(ctx context.Context, id string) (func(), error)
 // Register adds a new session handle to the registry.
 func (r *Registry) Register(id, agentName string, h backend.SessionHandle) {
 	e := &entry{
-		handle: h, agentName: agentName, generation: rand.Text(),
-		buffer: make([]Delivery, r.bufCap), subs: make(map[uint64]*subscriber),
+		handle: h, agentName: agentName,
+		subs: make(map[uint64]*subscriber),
 	}
 	if agentName == "codex" {
-		e.output = make(liveOutput)
+		e.output = newLiveOutput()
 	}
 	r.mu.Lock()
 	if previous := r.sessions[id]; previous != nil && previous.handle == h {
@@ -140,15 +117,15 @@ func (r *Registry) Register(id, agentName string, h backend.SessionHandle) {
 	go r.pump(id, e)
 }
 
-// pump sequences replayable updates. User interactions are live requests and
-// must not be stored or replayed. Give an elicitation to at most one client.
+// pump fans out backend events to live subscribers and maintains the current
+// state/usage snapshot for cold resumes. User interactions go to at most one
+// subscriber (the most recently attached capable connection).
 func (r *Registry) pump(id string, e *entry) {
 	for ev := range e.handle.Events() {
 		e.mu.Lock()
 		if ev.Kind == backend.EventTurnState && ev.Session == "" {
 			e.state = backend.TurnEvent{State: ev.Turn.State, Background: ev.Turn.Background}
 		}
-		d := Delivery{Event: ev}
 		delivered := false
 		switch ev.Kind {
 		case backend.EventElicitation, backend.EventPermission:
@@ -163,7 +140,7 @@ func (r *Registry) pump(id string, e *entry) {
 				}
 			}
 			if selected != nil {
-				delivered = e.send(latest, selected, d)
+				delivered = e.send(latest, selected, ev)
 				if delivered && ev.Kind == backend.EventElicitation {
 					request := ev.Elicitation
 					stop := context.AfterFunc(selected.ctx, func() { request.Reply(nil) })
@@ -171,8 +148,6 @@ func (r *Registry) pump(id string, e *entry) {
 				}
 			}
 		default:
-			e.next++
-			d.Cursor = Cursor{e.generation, e.next}
 			if ev.Kind == backend.EventUpdate && ev.Session == "" {
 				if usage, ok := ev.Update.Variant().(schema.SessionUpdateUsageUpdate); ok && usage.Size > 0 {
 					if usage.Cost.IsZero() {
@@ -181,12 +156,9 @@ func (r *Registry) pump(id string, e *entry) {
 					e.usage = usage
 				}
 			}
-			e.buffer[(e.next-1)%uint64(len(e.buffer))] = d
-			if e.output != nil && ev.Kind == backend.EventUpdate {
-				e.output.observe(d)
-			}
+			e.output.observe(ev)
 			for key, sub := range e.subs {
-				e.send(key, sub, d)
+				e.send(key, sub, ev)
 			}
 		}
 		e.mu.Unlock()
@@ -207,17 +179,17 @@ func (r *Registry) pump(id string, e *entry) {
 	r.mu.Unlock()
 	e.mu.Lock()
 	e.closed = true
-	for id, sub := range e.subs {
+	for key, sub := range e.subs {
 		sub.cancel()
 		close(sub.events)
-		delete(e.subs, id)
+		delete(e.subs, key)
 	}
 	e.mu.Unlock()
 }
 
-func (e *entry) send(id uint64, sub *subscriber, d Delivery) bool {
+func (e *entry) send(id uint64, sub *subscriber, ev backend.Event) bool {
 	select {
-	case sub.events <- d:
+	case sub.events <- ev:
 		return true
 	default:
 		delete(e.subs, id)
@@ -228,11 +200,9 @@ func (e *entry) send(id uint64, sub *subscriber, d Delivery) bool {
 	}
 }
 
-var ErrReplayGap = errors.New("replay cursor is no longer retained; use replayFrom:start")
-
-// Attach validates and replays a checkpoint and subscribes to subsequent
-// events under one lock. The snapshot describes that same position.
-func (r *Registry) Attach(id string, cursor *Cursor, canElicitForm, fromStart bool) (Subscription, error) {
+// Attach subscribes to subsequent events and captures the current state, usage,
+// and (for fromStart) in-flight output snapshot atomically under one lock.
+func (r *Registry) Attach(id string, canElicitForm, fromStart bool) (Subscription, error) {
 	r.mu.RLock()
 	e := r.sessions[id]
 	r.mu.RUnlock()
@@ -244,31 +214,20 @@ func (r *Registry) Attach(id string, cursor *Cursor, canElicitForm, fromStart bo
 	if e.closed {
 		return Subscription{}, ErrSessionNotFound
 	}
-	var replay []Delivery
 	var output []backend.HistoryUpdate
-	if cursor != nil {
-		oldest := e.next - min(e.next, uint64(len(e.buffer)))
-		if cursor.Generation != e.generation || cursor.Seq < oldest || cursor.Seq > e.next {
-			return Subscription{}, ErrReplayGap
-		}
-		for i := cursor.Seq; i < e.next; i++ {
-			replay = append(replay, e.buffer[i%uint64(len(e.buffer))])
-		}
-	}
 	if fromStart {
 		output = e.output.snapshot()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	sub := &subscriber{
-		events: make(chan Delivery, 256), overflow: make(chan struct{}),
+		events: make(chan backend.Event, 256), overflow: make(chan struct{}),
 		canElicitForm: canElicitForm, ctx: ctx, cancel: cancel,
 	}
 	key := e.subSeq
 	e.subSeq++
 	e.subs[key] = sub
 	return Subscription{
-		Events: sub.events, Overflow: sub.overflow, Replay: replay, LiveOutput: output, State: e.state, Usage: e.usage,
-		Cursor: Cursor{e.generation, e.next},
+		Events: sub.events, Overflow: sub.overflow, LiveOutput: output, State: e.state, Usage: e.usage,
 		Unsubscribe: func() {
 			e.mu.Lock()
 			defer e.mu.Unlock()

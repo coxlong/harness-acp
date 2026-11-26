@@ -86,7 +86,7 @@ func TestReadRolloutUsageWithoutReports(t *testing.T) {
 }
 
 func TestRestoredUsageRequiresAReadablePath(t *testing.T) {
-	b := New(t.Context(), "codex", nil)
+	b := New(t.Context(), "codex", nil, 0)
 	if _, err := b.restoredUsage("thread-4", ""); err != errNoRollout {
 		t.Fatalf("expected errNoRollout, got %v", err)
 	}
@@ -99,7 +99,7 @@ func TestRestoredUsageRequiresAReadablePath(t *testing.T) {
 func TestRestoredUsageFollowsTheRollout(t *testing.T) {
 	path := writeRollout(t,
 		tokenCount(counters(10, 5, 1, 16), counters(10, 5, 1, 16), 1000)+"\n")
-	b := New(t.Context(), "codex", nil)
+	b := New(t.Context(), "codex", nil, 0)
 
 	first, err := b.restoredUsage("thread-4", path)
 	if err != nil {

@@ -48,13 +48,13 @@ func main() {
 func run(ctx context.Context, cfg config.Config, stdioMode bool, agentName string) error {
 	agentReg := registry.New()
 	backends := make(map[string]backend.Backend)
-	sess := session.New(cfg.Session.ReplayBufSize)
+	sess := session.New()
 
 	if cfg.Agents.Codex.Enabled && (!stdioMode || agentName == "codex") {
 		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		info := agentReg.Probe(probeCtx, "codex", "Codex", cfg.Agents.Codex.MinVersion)
 		if info.Available {
-			be := codexbe.New(ctx, "codex", cfg.Agents.Codex.AllowDirs)
+			be := codexbe.New(ctx, "codex", cfg.Agents.Codex.AllowDirs, cfg.Session.PermissionTimeout)
 			_, err := be.Probe(probeCtx)
 			if err == nil {
 				backends["codex"] = be
@@ -98,10 +98,10 @@ func run(ctx context.Context, cfg config.Config, stdioMode bool, agentName strin
 func runServe(ctx context.Context, cfg config.Config, backends map[string]backend.Backend, sess *session.Registry, agentReg *registry.Registry) error {
 	srv := acppkg.NewServer(cfg, backends, sess, agentReg)
 	httpSrv := &http.Server{
-		Addr:         cfg.Listen,
-		Handler:      srv,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 0, // streaming
+		Addr:              cfg.Listen,
+		Handler:           srv,
+		ReadHeaderTimeout: 30 * time.Second,
+		WriteTimeout:      0, // streaming
 	}
 	log.Printf("harnessd listening on %s", cfg.Listen)
 	errCh := make(chan error, 1)
@@ -110,6 +110,7 @@ func runServe(ctx context.Context, cfg config.Config, backends map[string]backen
 	case <-ctx.Done():
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		_ = srv.Shutdown(shutCtx)
 		return httpSrv.Shutdown(shutCtx)
 	case err := <-errCh:
 		return err

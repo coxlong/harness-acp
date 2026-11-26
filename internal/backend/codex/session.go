@@ -417,7 +417,9 @@ func (s *Session) handle(m message) {
 		key := string(event.RequestID)
 		wasBlocked := s.waitingForUser()
 		if approval, ok := s.pending[key]; ok {
-			approval.timer.Stop()
+			if approval.timer != nil {
+				approval.timer.Stop()
+			}
 			delete(s.pending, key)
 		}
 		if input, ok := s.inputs[key]; ok {
@@ -491,7 +493,10 @@ func (s *Session) request(m message) {
 		}
 	}
 	key := string(m.ID)
-	timer := time.AfterFunc(2*time.Minute, func() { _ = s.Respond(key, backend.Decision{}) })
+	var timer *time.Timer
+	if s.p != nil && s.p.permissionTimeout > 0 {
+		timer = time.AfterFunc(s.p.permissionTimeout, func() { _ = s.Respond(key, backend.Decision{}) })
+	}
 	wasBlocked := s.waitingForUser()
 	s.pending[key] = approval{id: m.ID, method: m.Method, permissions: req.Permissions, decisions: decisions, timer: timer}
 	if req.TurnID != "" && s.turnID == "" {
@@ -525,7 +530,9 @@ func (s *Session) respondLocked(key string, d backend.Decision) bool {
 		return false
 	}
 	delete(s.pending, key)
-	req.timer.Stop()
+	if req.timer != nil {
+		req.timer.Stop()
+	}
 	decision := "decline"
 	if d.Cancelled {
 		decision = "cancel"
@@ -539,7 +546,9 @@ func (s *Session) respondLocked(key string, d backend.Decision) bool {
 
 func (s *Session) clearApprovals(decision string) {
 	for key, req := range s.pending {
-		req.timer.Stop()
+		if req.timer != nil {
+			req.timer.Stop()
+		}
 		delete(s.pending, key)
 		s.replyApproval(req, decision)
 	}
