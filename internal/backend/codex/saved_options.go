@@ -30,7 +30,8 @@ func (b *Backend) SavedOptions(ctx context.Context, id, _ string, dirs []string)
 	if err != nil {
 		return backend.Options{}, err
 	}
-	return sessionOptions(state.Model, state.Effort, state.Profile, state.Mode, state.Provider, state.Models, state.Profiles), nil
+	skills, _ := p.skills(ctx, append([]string{t.Cwd}, dirs...))
+	return sessionOptions(state.Model, state.Effort, state.Profile, state.Mode, state.Provider, state.Models, state.Profiles, skills), nil
 }
 
 type turnSettings struct {

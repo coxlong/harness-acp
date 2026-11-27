@@ -208,6 +208,7 @@ func (b *Backend) restoreUsage(s *Session, path string) {
 	if s.closed || s.sawUsage || usage.ModelContextWindow == 0 || usage.Last.TotalTokens == 0 {
 		return
 	}
+	s.lastUsage = &usage
 	s.emit(usageEvent(usage))
 }
 
@@ -235,10 +236,16 @@ func (b *Backend) open(ctx context.Context, method string, params object, mode s
 		return nil, err
 	}
 	if active == s {
+		var addDirs []string
+		if roots, ok := params["runtimeWorkspaceRoots"].([]string); ok && len(roots) > 1 {
+			addDirs = append([]string(nil), roots[1:]...)
+		}
 		models := p.models(ctx, result.Provider)
-		profiles := p.profiles(ctx, result.Thread.Cwd)
+		profiles := p.profiles(ctx, s.cwd)
+		skills, _ := p.skills(ctx, append([]string{s.cwd}, addDirs...))
+		cmdsKey := commandsKey(codexCommands(skills))
 		s.mu.Lock()
-		s.models, s.profiles = models, profiles
+		s.models, s.profiles, s.additionalDirs, s.skills, s.publishedCmdsKey = models, profiles, addDirs, skills, cmdsKey
 		if method != "thread/start" {
 			s.watchTerminals()
 		}

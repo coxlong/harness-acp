@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/coxlong/harness-acp/internal/backend"
 	"github.com/ironpark/acp-go/acp2"
@@ -22,15 +23,34 @@ const (
 	configEffort = "effort"
 )
 
+// initCommand is one slash command entry from Claude Code's `initialize` answer
+// or a live `commands_changed` update.
+type initCommand struct {
+	Name         string          `json:"name"`
+	Description  string          `json:"description"`
+	ArgumentHint json.RawMessage `json:"argumentHint"`
+}
+
+func (c initCommand) argumentHintText() string {
+	if len(c.ArgumentHint) == 0 {
+		return ""
+	}
+	var single string
+	if json.Unmarshal(c.ArgumentHint, &single) == nil {
+		return strings.TrimSpace(single)
+	}
+	var many []string
+	if json.Unmarshal(c.ArgumentHint, &many) == nil {
+		return strings.TrimSpace(strings.Join(many, " "))
+	}
+	return ""
+}
+
 // initInfo is the part of Claude Code's `initialize` answer that sessions use.
 type initInfo struct {
-	Commands []struct {
-		Name         string `json:"name"`
-		Description  string `json:"description"`
-		ArgumentHint string `json:"argumentHint"`
-	} `json:"commands"`
-	Models                []modelInfo `json:"models"`
-	CurrentPermissionMode string      `json:"current_permission_mode"`
+	Commands              []initCommand `json:"commands"`
+	Models                []modelInfo   `json:"models"`
+	CurrentPermissionMode string        `json:"current_permission_mode"`
 }
 
 type modelInfo struct {
@@ -99,7 +119,7 @@ func (s *Session) optionsLocked() backend.Options {
 	}
 	return backend.Options{
 		Config:   buildConfigOptions(s.info, s.cfgLocked()),
-		Commands: buildCommands(s.info),
+		Commands: buildCommands(s.info, s.terminalCommands),
 	}
 }
 
@@ -107,16 +127,45 @@ func (s *Session) cfgLocked() sessionConfig {
 	return sessionConfig{mode: s.opts.Mode, model: s.opts.Model, effort: s.opts.Effort}
 }
 
-func buildCommands(info *initInfo) []acp2.AvailableCommand {
+// unsupportedCommands are Claude Code commands whose UX cannot run in an ACP
+// client (mirrors claude-agent-acp/src/slash-commands.ts).
+var unsupportedCommands = []string{
+	"clear",
+	"cost",
+	"keybindings-help",
+	"login",
+	"logout",
+	"output-style:new",
+	"release-notes",
+	"todos",
+}
+
+func buildCommands(info *initInfo, terminalCommands []string) []acp2.AvailableCommand {
+	if info == nil || len(info.Commands) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(info.Commands))
 	out := make([]acp2.AvailableCommand, 0, len(info.Commands))
 	for _, c := range info.Commands {
-		name := strings.TrimPrefix(c.Name, "/")
-		if name == "" {
+		rawName := strings.TrimPrefix(c.Name, "/")
+		if rawName == "" || slices.Contains(terminalCommands, rawName) || slices.Contains(terminalCommands, c.Name) {
 			continue
 		}
+		name := rawName
+		if strings.HasSuffix(name, " (MCP)") {
+			name = "mcp:" + strings.TrimSuffix(name, " (MCP)")
+		}
+		if slices.Contains(unsupportedCommands, name) {
+			continue
+		}
+		// ACP v2: command names MUST NOT contain whitespace and MUST be unique.
+		if strings.IndexFunc(name, unicode.IsSpace) >= 0 || seen[name] {
+			continue
+		}
+		seen[name] = true
 		cmd := schema.AvailableCommandCommand{Name: name, Description: c.Description}
-		if c.ArgumentHint != "" {
-			cmd.Input = schema.NewAvailableCommandInput(schema.AvailableCommandInputText{Hint: c.ArgumentHint})
+		if hint := c.argumentHintText(); hint != "" {
+			cmd.Input = schema.NewAvailableCommandInput(schema.AvailableCommandInputText{Hint: hint})
 		}
 		out = append(out, schema.NewAvailableCommand(cmd))
 	}

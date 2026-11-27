@@ -39,33 +39,44 @@ type Session struct {
 	last     backend.TurnEvent
 	running  bool // Codex can announce a child before its turn starts
 
-	closed       bool
-	turnID       string
-	turnDone     chan struct{}
-	submitting   bool
-	staged       []message
-	model        string
-	provider     string
-	effort       string
-	mode         string
-	sendMode     bool
-	fresh        bool
-	instructions string
-	models       []model
-	profile      string
-	profiles     []profile
-	cwd          string
-	deltaItems   map[string]bool
-	plans        map[string]string
-	published    map[string]bool
-	pending      map[string]approval
-	inputs       map[string]pendingInput
-	terminals    map[string]terminalTask
-	watching     bool
-	terminalMu   sync.Mutex
+	closed           bool
+	turnID           string
+	interruptTurnID  string
+	reviewTurn       bool
+	turnDone         chan struct{}
+	submitting       bool
+	staged           []message
+	model            string
+	provider         string
+	effort           string
+	mode             string
+	sendMode         bool
+	fresh            bool
+	instructions     string
+	models           []model
+	profile          string
+	profiles         []profile
+	cwd              string
+	additionalDirs   []string
+	skills           []skillInfo
+	publishedCmdsKey string
+	skillsTimer      *time.Timer
+	skillsDeadline   time.Time
+	skillsRev        uint64
+	deltaItems       map[string]bool
+	plans            map[string]string
+	published        map[string]bool
+	pending          map[string]approval
+	inputs           map[string]pendingInput
+	terminals        map[string]terminalTask
+	compactions      map[string]*codexCompaction
+	latestCompaction map[string]*codexCompaction
+	watching         bool
+	terminalMu       sync.Mutex
 	// sawUsage: the live thread reported its usage, so a restored one would
 	// be older than what the client already has.
-	sawUsage bool
+	sawUsage  bool
+	lastUsage *tokenUsage
 }
 
 var _ backend.SessionHandle = (*Session)(nil)
@@ -88,6 +99,7 @@ func makeSession(p *process, result threadResponse, parent *Session) *Session {
 		model: result.Model, provider: result.Provider, effort: result.Effort,
 		deltaItems: make(map[string]bool), published: make(map[string]bool), pending: make(map[string]approval), inputs: make(map[string]pendingInput),
 		plans: make(map[string]string), terminals: make(map[string]terminalTask),
+		compactions: make(map[string]*codexCompaction), latestCompaction: make(map[string]*codexCompaction),
 	}
 	if parent != nil {
 		s.mu = parent.mu
@@ -124,6 +136,12 @@ func (s *Session) Send(ctx context.Context, blocks []acp2.ContentBlock) (acp2.Me
 	// Once sent, collect the result even if the ACP connection goes away.
 	// The Codex turn and the event registry outlive that connection.
 	ctx = context.WithoutCancel(ctx)
+	if handled, err := s.tryCommand(ctx, id, blocks); handled {
+		if err != nil {
+			return "", err
+		}
+		return id, nil
+	}
 	turnID, err := s.submit(ctx, id, blocks, input)
 	var rpc *rpcError
 	if err != nil && turnID != "" && errors.As(err, &rpc) {
@@ -213,16 +231,28 @@ func (s *Session) Cancel(ctx context.Context) error {
 
 func (s *Session) interrupt(ctx context.Context) (<-chan struct{}, error) {
 	s.mu.Lock()
-	id, done := s.turnID, s.turnDone
+	done := s.turnDone
+	targetID := func() string {
+		if s.interruptTurnID != "" {
+			return s.interruptTurnID
+		}
+		return s.turnID
+	}
+	id := targetID()
 	s.mu.Unlock()
 	if id == "" {
 		return nil, nil
 	}
-	params := object{"threadId": s.id, "turnId": id}
 	retryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	for {
-		err := s.p.call(retryCtx, "turn/interrupt", params, nil)
+		s.mu.Lock()
+		id = targetID()
+		s.mu.Unlock()
+		if id == "" {
+			return done, nil
+		}
+		err := s.p.call(retryCtx, "turn/interrupt", object{"threadId": s.id, "turnId": id}, nil)
 		if err == nil {
 			return done, nil
 		}
@@ -235,8 +265,9 @@ func (s *Session) interrupt(ctx context.Context) (<-chan struct{}, error) {
 				return done, err
 			}
 		}
-		// turn/start can acknowledge a turn just before the runtime marks it
-		// interruptible. Retry that specific response while this turn exists.
+		// turn/start or review/start can acknowledge a turn just before the
+		// runtime marks it interruptible (or spawns the child reviewer turn).
+		// Retry that specific response while this turn exists.
 		timer := time.NewTimer(40 * time.Millisecond)
 		select {
 		case <-done:
@@ -284,12 +315,27 @@ func (s *Session) endLocked(err error) {
 		return
 	}
 	if s.parent == nil {
+		if s.skillsTimer != nil {
+			s.skillsTimer.Stop()
+			s.skillsTimer = nil
+		}
+		s.skillsDeadline = time.Time{}
+		if err != nil {
+			s.finishAllCompactions(schema.CompactionStatusFailed)
+		} else {
+			s.finishAllCompactions(schema.CompactionStatusCancelled)
+		}
 		s.closed = true
 		for _, child := range s.children {
 			child.endLocked(err)
 		}
 	} else {
 		s.running = false
+		if err != nil {
+			s.finishAllCompactions(schema.CompactionStatusFailed)
+		} else {
+			s.finishAllCompactions(schema.CompactionStatusCancelled)
+		}
 		for _, id := range sortedIDs(s.terminals) {
 			s.terminalEnded(id, optional.Of(schema.ToolCallStatusCancelled))
 		}
@@ -341,19 +387,36 @@ func (s *Session) state(state backend.TurnState, reason acp2.StopReason, err err
 }
 
 func (s *Session) startTurn(id string) {
-	if s.closed || id == "" || id == s.turnID {
+	if s.closed || id == "" {
+		return
+	}
+	if id == s.turnID {
+		s.interruptTurnID = id
+		return
+	}
+	if s.reviewTurn && s.turnID != "" {
+		// Codex answers review/start with the parent turn id (used for items
+		// and turn/completed), then emits turn/started for a child reviewer
+		// turn (which turn/interrupt targets). Keep s.turnID on the parent so
+		// turn/completed still finishes the turn.
+		s.interruptTurnID = id
 		return
 	}
 	if s.turnDone != nil {
 		close(s.turnDone)
 	}
 	s.turnID = id
+	s.interruptTurnID = id
+	s.reviewTurn = false
 	s.fresh = false
 	s.turnDone = make(chan struct{})
 	clear(s.deltaItems)
 	clear(s.plans)
+	wasRunning := s.running
 	s.running = true
-	s.state(backend.TurnRunning, "", nil)
+	if !wasRunning {
+		s.state(backend.TurnRunning, "", nil)
+	}
 }
 
 func (s *Session) finishTurn(t turn) {
@@ -362,14 +425,21 @@ func (s *Session) finishTurn(t turn) {
 	}
 	s.clearApprovals("cancel")
 	s.clearInputs()
+	end := turnEnd(t)
+	if end.Err != nil {
+		s.finishTurnCompactions(t.ID, schema.CompactionStatusFailed, end.Err.Error())
+	} else {
+		s.finishTurnCompactions(t.ID, schema.CompactionStatusCancelled, "")
+	}
 	s.turnID = ""
+	s.interruptTurnID = ""
+	s.reviewTurn = false
 	close(s.turnDone)
 	s.turnDone = nil
 	clear(s.deltaItems)
 	clear(s.plans)
 	clear(s.published)
 	s.running = false
-	end := turnEnd(t)
 	s.state(end.State, end.StopReason, end.Err)
 	s.watchTerminals()
 }

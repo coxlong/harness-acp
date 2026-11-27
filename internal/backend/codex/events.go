@@ -157,6 +157,21 @@ func (s *Session) translate(method string, e notification) {
 		}
 	case "item/started", "item/completed":
 		final := method == "item/completed"
+		if e.Item.Type == "contextCompaction" {
+			if !final && e.TurnID != "" && s.turnID == "" {
+				s.startTurn(e.TurnID)
+			}
+			turnID := e.TurnID
+			if turnID == "" {
+				turnID = s.turnID
+			}
+			if final {
+				s.completeCompaction(turnID, e.Item.ID)
+			} else {
+				s.startCompaction(turnID, e.Item.ID)
+			}
+			return
+		}
 		if e.Item.Type == "userMessage" && s.published[e.Item.ClientID] {
 			// The insertion acknowledgement already published this message.
 			return
@@ -201,8 +216,15 @@ func (s *Session) translate(method string, e notification) {
 		} else {
 			s.emit(update(schema.SessionUpdateSessionInfoUpdate{Title: optional.Of(e.ThreadName)}))
 		}
+	case "thread/compacted":
+		turnID := e.TurnID
+		if turnID == "" {
+			turnID = s.turnID
+		}
+		s.completeLegacyCompaction(turnID)
 	case "thread/tokenUsage/updated":
 		u := e.TokenUsage
+		s.lastUsage = &u
 		if u.ModelContextWindow > 0 && u.Last.TotalTokens > 0 {
 			s.sawUsage = true
 			s.emit(usageEvent(u))
@@ -248,6 +270,13 @@ func (i item) events(final, streamed bool, streamEnd optional.Value[schema.Meta]
 	case "plan":
 		if final && i.Text != "" {
 			return []backend.Event{markdownPlan(i.ID, i.Text)}
+		}
+	case "contextCompaction":
+		if final {
+			return []backend.Event{update(schema.SessionUpdateCompactionUpdate{
+				CompactionID: schema.CompactionID(i.ID),
+				Status:       schema.CompactionStatusCompleted,
+			})}
 		}
 	case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "webSearch":
 		return i.toolEvents(final)

@@ -30,8 +30,9 @@ type line struct {
 	// API request (authentication_failed, rate_limit, ...).
 	Error string `json:"error"`
 
-	UUID        string `json:"uuid"`
-	IsSynthetic bool   `json:"isSynthetic"`
+	UUID             string `json:"uuid"`
+	IsSynthetic      bool   `json:"isSynthetic"`
+	IsCompactSummary bool   `json:"isCompactSummary"`
 	// user: Claude Code's structured form of a tool's result (an Edit's patch,
 	// a Bash's stdout, a background task's id, ...).
 	ToolUseResult json.RawMessage `json:"tool_use_result"`
@@ -75,6 +76,11 @@ type line struct {
 	MaxRetries   int  `json:"max_retries"`
 	RetryDelayMs int  `json:"retry_delay_ms"`
 	ErrorStatus  *int `json:"error_status"`
+
+	// system/init, system/commands_changed, system/local_command_output
+	TerminalSlashCommands []string      `json:"terminal_slash_commands"`
+	Commands              []initCommand `json:"commands"`
+	Content               string        `json:"content"`
 }
 
 // block is one content block of an assistant or user message.
@@ -195,9 +201,10 @@ type translator struct {
 	stops      []stopJob               // terminals the session should end
 	// lastCompaction is the compaction that ended last, for its summary; compacted
 	// is set while its compact_boundary is still to come.
-	lastCompaction  string
-	compacted       bool
-	streamedSummary string // summary text already sent as chunks
+	lastCompaction      string
+	compacted           bool
+	streamedSummary     string // summary text already sent as chunks
+	duplicateCompactErr string // failed compaction error to suppress from local_command_output
 }
 
 type toolInfo struct {

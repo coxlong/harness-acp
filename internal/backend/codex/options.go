@@ -62,6 +62,8 @@ func (b *Backend) Options(ctx context.Context, cwd string, dirs []string) (backe
 		selectProvider := providerOption(catalog.Provider, "Provider for new sessions", choices...)
 		out.Config = append([]acp2.SessionConfigOption{selectProvider}, out.Config...)
 	}
+	skills, _ := p.skills(ctx, append([]string{cwd}, dirs...))
+	out.Commands = codexCommands(skills)
 	return out, nil
 }
 
@@ -72,16 +74,17 @@ func (s *Session) Options() backend.Options {
 }
 
 func (s *Session) optionsLocked() backend.Options {
-	return sessionOptions(s.model, s.effort, s.profile, s.mode, s.provider, s.models, s.profiles)
+	return sessionOptions(s.model, s.effort, s.profile, s.mode, s.provider, s.models, s.profiles, s.skills)
 }
 
-func sessionOptions(modelID, effort, profileID, mode, provider string, models []model, profiles []profile) backend.Options {
+func sessionOptions(modelID, effort, profileID, mode, provider string, models []model, profiles []profile, skills []skillInfo) backend.Options {
 	out := options(modelID, effort, models)
 	out.Config = appendMode(out.Config, profileID, profiles)
 	out.Config = appendCollaboration(out.Config, mode, modelID)
 	if provider != "" {
 		out.Config = append(out.Config, providerOption(provider, "Provider selected when this session was created", choice(provider, provider)))
 	}
+	out.Commands = codexCommands(skills)
 	return out
 }
 
@@ -168,6 +171,10 @@ func (s *Session) ConfigureInitial(ctx context.Context, values []backend.ConfigS
 func (s *Session) configure(ctx context.Context, values []backend.ConfigSelection, initial bool) error {
 	s.ops.Lock()
 	defer s.ops.Unlock()
+	return s.configureLocked(ctx, values, initial)
+}
+
+func (s *Session) configureLocked(ctx context.Context, values []backend.ConfigSelection, initial bool) error {
 	s.mu.Lock()
 	state := selectionOptions{Model: s.model, Effort: s.effort, Models: s.models, Profile: s.profile, Profiles: s.profiles}
 	oldProfile := s.profile

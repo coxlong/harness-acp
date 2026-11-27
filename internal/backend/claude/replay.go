@@ -30,13 +30,14 @@ import (
 // and other bookkeeping lines, some of which carry a `message` that looks
 // like one.
 type transcriptLine struct {
-	Type        string          `json:"type"`
-	UUID        string          `json:"uuid"`
-	Cwd         string          `json:"cwd"`
-	IsSidechain bool            `json:"isSidechain"`
-	IsMeta      bool            `json:"isMeta"`
-	Message     json.RawMessage `json:"message"`
-	Origin      *struct {
+	Type             string          `json:"type"`
+	UUID             string          `json:"uuid"`
+	Cwd              string          `json:"cwd"`
+	IsSidechain      bool            `json:"isSidechain"`
+	IsMeta           bool            `json:"isMeta"`
+	IsCompactSummary bool            `json:"isCompactSummary"`
+	Message          json.RawMessage `json:"message"`
+	Origin           *struct {
 		Kind string `json:"kind"`
 	} `json:"origin"`
 }
@@ -57,7 +58,7 @@ func readTranscript(path string, sidechain bool) ([]transcriptLine, error) {
 		if json.Unmarshal(sc.Bytes(), &l) != nil {
 			continue
 		}
-		if (l.IsSidechain && !sidechain) || l.IsMeta || (l.Type != "user" && l.Type != "assistant") {
+		if (l.IsSidechain && !sidechain) || (l.IsMeta && !l.IsCompactSummary) || (l.Type != "user" && l.Type != "assistant") {
 			continue
 		}
 		out = append(out, l)
@@ -764,6 +765,20 @@ func (h *history) tool(u schema.SessionUpdateToolCallUpdate) {
 
 func (h *history) user(l *transcriptLine) {
 	h.flush()
+	if l.IsCompactSummary {
+		if h.owner != nil {
+			return
+		}
+		u := schema.SessionUpdateCompactionUpdate{
+			CompactionID: schema.CompactionID(firstNonEmpty(l.UUID, newUUID())),
+			Status:       schema.CompactionStatusCompleted,
+		}
+		if summary := compactionSummaryText(userText(l.Message)); summary != "" {
+			u.Summary = optional.Of([]acp2.ContentBlock{acp2.TextBlock(summary)})
+		}
+		h.emit(schema.NewSessionUpdate(u))
+		return
+	}
 	var m message
 	if json.Unmarshal(l.Message, &m) != nil {
 		return

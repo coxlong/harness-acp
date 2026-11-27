@@ -235,6 +235,18 @@ func (p *process) deliverReply(m message) {
 }
 
 func (p *process) dispatch(m message) {
+	if m.Method == "skills/changed" {
+		p.mu.Lock()
+		roots := make([]*Session, 0, len(p.sessions))
+		for _, s := range p.sessions {
+			roots = append(roots, s)
+		}
+		p.mu.Unlock()
+		for _, s := range roots {
+			s.scheduleSkillsRefresh()
+		}
+		return
+	}
 	var key struct {
 		ThreadID string `json:"threadId"`
 		Thread   thread `json:"thread"`

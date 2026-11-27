@@ -60,6 +60,7 @@ func (t *translator) compactionStart(id string) []backend.Event {
 	t.compaction = id
 	t.compacted = false
 	t.streamedSummary = ""
+	t.duplicateCompactErr = ""
 	return one(compactionUpdate(id, schema.CompactionStatusInProgress, ""))
 }
 
@@ -70,9 +71,27 @@ func (t *translator) compactionEnd(status schema.CompactionStatus, errText strin
 	}
 	id := t.compaction
 	t.compaction = ""
-	t.lastCompaction = id
-	t.compacted = status == schema.CompactionStatusCompleted
+	if status == schema.CompactionStatusCompleted {
+		t.lastCompaction = id
+		t.compacted = true
+	} else {
+		t.lastCompaction = ""
+		t.compacted = false
+	}
+	if status == schema.CompactionStatusFailed && strings.TrimSpace(errText) != "" {
+		t.duplicateCompactErr = strings.TrimSpace(errText)
+	}
 	return one(compactionUpdate(id, status, errText))
+}
+
+// consumeDuplicateCompactError suppresses the duplicate local_command_output
+// Claude Code emits after a failed manual /compact (mirrors context-compaction.ts).
+func (t *translator) consumeDuplicateCompactError(content string) bool {
+	if t.duplicateCompactErr == "" || strings.TrimSpace(content) != t.duplicateCompactErr {
+		return false
+	}
+	t.duplicateCompactErr = ""
+	return true
 }
 
 // compactionOnce reports a compaction that ended without ever being seen starting.
@@ -98,15 +117,21 @@ func (t *translator) compactionChunk(text string) []backend.Event {
 	}))
 }
 
-// compactionCancel ends a compaction that is still open when its turn ends.
+// compactionCancel ends a compaction that is still open when its turn ends,
+// and resets turn-scoped compaction state so it cannot bleed into later turns.
 func (t *translator) compactionCancel() []backend.Event {
-	return t.compactionEnd(schema.CompactionStatusCancelled, "")
+	evs := t.compactionEnd(schema.CompactionStatusCancelled, "")
+	t.lastCompaction = ""
+	t.compacted = false
+	t.streamedSummary = ""
+	t.duplicateCompactErr = ""
+	return evs
 }
 
 // compactSummary reports the summary that Claude Code keeps after a compaction,
 // which it sends as a synthetic user message after the compaction ended.
 func (t *translator) compactSummary(l *line) []backend.Event {
-	if !l.IsSynthetic || t.lastCompaction == "" {
+	if (!l.IsSynthetic && !l.IsCompactSummary) || t.lastCompaction == "" {
 		return nil
 	}
 	var m message
@@ -114,7 +139,12 @@ func (t *translator) compactSummary(l *line) []backend.Event {
 	if json.Unmarshal(l.Message, &m) != nil || json.Unmarshal(m.Content, &text) != nil {
 		return nil
 	}
-	summary := compactionSummaryText(text)
+	var summary string
+	if l.IsCompactSummary {
+		summary = compactionSummaryText(text)
+	} else {
+		summary = persistedContinuationSummary(text)
+	}
 	if summary == "" {
 		return nil
 	}
@@ -135,6 +165,12 @@ func (t *translator) compactSummary(l *line) []backend.Event {
 }
 
 var (
+	analysisBlocks = []*regexp.Regexp{
+		regexp.MustCompile(`(?im)^[ \t]*<analysis>[ \t]*\r?\n[\s\S]*?\n[ \t]*</analysis>[ \t]*$`),
+		regexp.MustCompile(`(?i)^\s*<analysis>[\s\S]*?</analysis>`),
+	}
+	summaryOpenLine      = regexp.MustCompile(`(?im)^[ \t]*<summary>[ \t]*\r?\n`)
+	summaryCloseLine     = regexp.MustCompile(`(?im)^[ \t]*</summary>[ \t]*$`)
 	continuationPreamble = regexp.MustCompile(`(?i)^\s*This session is being continued from a previous conversation`)
 	persistedPreamble    = regexp.MustCompile(`^\s*This session is being continued from a previous conversation[^\n]*\n(?:[\s\S]*?\n)?Summary:[ \t]*\r?\n`)
 	persistedTrailers    = []*regexp.Regexp{
@@ -143,19 +179,64 @@ var (
 	}
 )
 
-// compactionSummaryText reduces the continuation message Claude Code persists to
-// the summary a user can read, without the instructions that frame it for the
-// model. A message whose framing is not recognised yields no summary.
-func compactionSummaryText(raw string) string {
-	if !continuationPreamble.MatchString(raw) {
+// persistedContinuationSummary extracts a summary only when the text carries
+// Claude Code's continuation preamble (so unrelated synthetic messages that
+// happen to contain HTML `<summary>` tags are never misread as compaction text).
+func persistedContinuationSummary(raw string) string {
+	text := raw
+	for _, block := range analysisBlocks {
+		text = block.ReplaceAllString(text, "")
+	}
+	if !continuationPreamble.MatchString(text) {
 		return ""
 	}
-	body := persistedPreamble.ReplaceAllString(raw, "")
-	if body == raw {
+	return stripContinuationFraming(text)
+}
+
+func stripContinuationFraming(text string) string {
+	body := persistedPreamble.ReplaceAllString(text, "")
+	if body == text {
 		return ""
 	}
 	for _, tr := range persistedTrailers {
 		body = tr.ReplaceAllString(body, "")
 	}
 	return strings.TrimSpace(body)
+}
+
+// compactionSummaryText reduces the continuation message Claude Code persists to
+// the summary a user can read, without the instructions or `<analysis>`/`<summary>`
+// tags that frame it for the model. A message whose framing is not recognised
+// yields no summary.
+func compactionSummaryText(raw string) string {
+	text := raw
+	for _, block := range analysisBlocks {
+		text = block.ReplaceAllString(text, "")
+	}
+	if tagged, ok := taggedSummary(text); ok {
+		return strings.TrimSpace(tagged)
+	}
+	if !continuationPreamble.MatchString(text) {
+		return ""
+	}
+	return stripContinuationFraming(text)
+}
+
+func taggedSummary(raw string) (string, bool) {
+	closes := summaryCloseLine.FindAllStringIndex(raw, -1)
+	if len(closes) > 0 {
+		closeStart := closes[len(closes)-1][0]
+		opens := summaryOpenLine.FindAllStringIndex(raw[:closeStart], -1)
+		if len(opens) > 0 {
+			openEnd := opens[len(opens)-1][1]
+			return raw[openEnd:closeStart], true
+		}
+	}
+	lower := strings.ToLower(raw)
+	openIdx := strings.Index(lower, "<summary>")
+	closeIdx := strings.LastIndex(lower, "</summary>")
+	if openIdx >= 0 && closeIdx > openIdx {
+		return raw[openIdx+len("<summary>") : closeIdx], true
+	}
+	return "", false
 }

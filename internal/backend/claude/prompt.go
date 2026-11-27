@@ -3,9 +3,15 @@ package claude
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 
 	"github.com/ironpark/acp-go/acp2"
 )
+
+// mcpSlashRe rewrites ACP-normalized `/mcp:server:command [args]` back to
+// Claude Code's native `/server:command (MCP)[ args]` form (mirrors
+// claude-agent-acp/src/prompt-to-claude.ts).
+var mcpSlashRe = regexp.MustCompile(`^/mcp:([^:\s]+):(\S+)(?:\s+([\s\S]*))?$`)
 
 // userEnvelope is the stream-json user message written to claude's stdin.
 // `origin: human` matters: Claude Code treats a message without it as
@@ -39,6 +45,7 @@ func buildUserMessage(sessionID, msgUUID string, blocks []acp2.ContentBlock) ([]
 		return nil, fmt.Errorf("invalid params: prompt must hold at least one content block")
 	}
 	var content, context []any
+	sawText := false
 	for _, b := range blocks {
 		// Marshal to a generic map so this does not depend on the shape of the
 		// generated union types.
@@ -54,7 +61,17 @@ func buildUserMessage(sessionID, msgUUID string, blocks []acp2.ContentBlock) ([]
 
 		switch typ := str("type"); typ {
 		case "text":
-			content = append(content, map[string]any{"type": "text", "text": str("text")})
+			text := str("text")
+			if !sawText {
+				sawText = true
+				if parts := mcpSlashRe.FindStringSubmatch(text); parts != nil {
+					text = "/" + parts[1] + ":" + parts[2] + " (MCP)"
+					if parts[3] != "" {
+						text += " " + parts[3]
+					}
+				}
+			}
+			content = append(content, map[string]any{"type": "text", "text": text})
 		case "resource_link":
 			content = append(content, map[string]any{"type": "text", "text": uriLink(str("uri"))})
 		case "image":

@@ -6,12 +6,14 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/coxlong/harness-acp/internal/backend"
 	"github.com/ironpark/acp-go/acp2"
+	schema "github.com/ironpark/acp-go/schema/v2"
 )
 
 // Session is one Claude Code conversation. It implements backend.SessionHandle.
@@ -30,18 +32,19 @@ type Session struct {
 	// mu serialises every state change together with the events it produces,
 	// so a client sees user_message → running → output → idle in order. It is
 	// held across channel sends; Close unblocks them via done.
-	mu         sync.Mutex
-	opts       SpawnOpts // opts.New flips to false after the first spawn
-	tr         *translator
-	foreground bool // a turn is open
-	cancelling bool // session/cancel hit the open turn; its idle reports cancelled
-	pending    map[string]pendingPerm
-	info       *initInfo          // what Claude Code offers; set by Init
-	tailers    map[string]*tailer // by terminal id
-	bgKey      string             // the background work last reported, as JSON
-	titled     bool               // a session title went out
-	titling    bool               // a title request is out
-	reqSeq     atomic.Uint64
+	mu               sync.Mutex
+	opts             SpawnOpts // opts.New flips to false after the first spawn
+	tr               *translator
+	foreground       bool // a turn is open
+	cancelling       bool // session/cancel hit the open turn; its idle reports cancelled
+	pending          map[string]pendingPerm
+	info             *initInfo          // what Claude Code offers; set by Init
+	terminalCommands []string           // CLI terminal-bound slash commands from system/init
+	tailers          map[string]*tailer // by terminal id
+	bgKey            string             // the background work last reported, as JSON
+	titled           bool               // a session title went out
+	titling          bool               // a title request is out
+	reqSeq           atomic.Uint64
 
 	startedWork bool // foreground work has started on this handle
 
@@ -131,6 +134,7 @@ func (s *Session) Send(ctx context.Context, blocks []acp2.ContentBlock) (acp2.Me
 		s.foreground = true
 		s.cancelling = false
 		s.tr.agentText = false
+		s.tr.duplicateCompactErr = ""
 		p.busy.Store(true)
 	}
 	s.send(userMessage(msgID, blocks))
@@ -312,8 +316,33 @@ func (s *Session) handle(p *proc, raw []byte) {
 		// answered it): stop waiting for the user.
 		s.permissionWithdrawn(l.RequestID)
 	case "system":
-		for _, ev := range s.tr.system(&l) {
-			s.send(ev)
+		switch l.Subtype {
+		case "init":
+			if len(l.TerminalSlashCommands) > 0 && !slices.Equal(s.terminalCommands, l.TerminalSlashCommands) {
+				s.terminalCommands = slices.Clone(l.TerminalSlashCommands)
+				if s.info != nil {
+					s.send(update(schema.SessionUpdateAvailableCommandsUpdate{
+						AvailableCommands: buildCommands(s.info, s.terminalCommands),
+					}))
+				}
+			}
+		case "commands_changed":
+			if s.info == nil {
+				s.info = &initInfo{}
+			}
+			s.info.Commands = l.Commands
+			s.send(update(schema.SessionUpdateAvailableCommandsUpdate{
+				AvailableCommands: buildCommands(s.info, s.terminalCommands),
+			}))
+		case "local_command_output":
+			if l.Content != "" && !s.tr.consumeDuplicateCompactError(l.Content) {
+				s.tr.agentText = true
+				s.send(agentChunkEv(firstNonEmpty(l.UUID, newUUID()), l.Content))
+			}
+		default:
+			for _, ev := range s.tr.system(&l) {
+				s.send(ev)
+			}
 		}
 	case "result":
 		s.result(p, raw)
