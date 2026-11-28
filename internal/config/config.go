@@ -9,7 +9,7 @@ import (
 // Config is the top-level harnessd configuration.
 type Config struct {
 	Listen    string // default "127.0.0.1:7800"
-	Token     string // bearer token; empty = no auth (dev only)
+	Token     string // bearer token required in HTTP/WebSocket mode
 	TLS       TLSConfig
 	Agents    AgentsCfg
 	Session   SessionCfg

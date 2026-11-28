@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -58,6 +59,7 @@ func TestReliableWSPreservesSessionAndPermissionAcrossDisconnect(t *testing.T) {
 		decisions: make(chan backend.Decision, 4),
 	}
 	cfg := config.Default()
+	cfg.Token = testBearerToken
 	cfg.Transport.DisconnectTTL = time.Minute
 	srv := NewServer(cfg, map[string]backend.Backend{"claude": &fakeLiveBackend{handle: handle}}, session.New(), registry.New())
 	t.Cleanup(func() { _ = srv.Close() })
@@ -70,7 +72,9 @@ func TestReliableWSPreservesSessionAndPermissionAcrossDisconnect(t *testing.T) {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		ws, _, err := websocket.Dial(ctx, wsURL, nil)
+		ws, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+			HTTPHeader: http.Header{"Authorization": {"Bearer " + testBearerToken}},
+		})
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}

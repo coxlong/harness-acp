@@ -10,8 +10,11 @@ go build -o harnessd ./cmd/harnessd
 
 ## 运行
 
+HTTP/WebSocket 模式启动前须通过环境变量 `HARNESSD_TOKEN` 设置非空访问令牌，客户端连接时使用同一个令牌。本地 stdio 模式无需令牌。
+
 ```bash
 ./harnessd --version
+export HARNESSD_TOKEN="$(openssl rand -hex 32)"
 ./harnessd
 ```
 

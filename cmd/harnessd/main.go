@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -46,6 +47,10 @@ func main() {
 }
 
 func run(ctx context.Context, cfg config.Config, stdioMode bool, agentName string) error {
+	if !stdioMode && strings.TrimSpace(cfg.Token) == "" {
+		return fmt.Errorf("HARNESSD_TOKEN must be set to a non-blank value in server mode")
+	}
+
 	agentReg := registry.New()
 	backends := make(map[string]backend.Backend)
 	sess := session.New()

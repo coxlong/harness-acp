@@ -15,6 +15,8 @@ import (
 	"github.com/coxlong/harness-acp/internal/version"
 )
 
+const testBearerToken = "test-secret"
+
 // discoveryServer builds a server with no ACP endpoints: discovery is the only
 // route under test.
 func discoveryServer(t *testing.T, cfg config.Config, agents ...registry.AgentInfo) http.Handler {
@@ -40,11 +42,13 @@ func getDiscovery(t *testing.T, h http.Handler, token string) *httptest.Response
 // The client reads these exact field names; Go's default names would be
 // PascalCase and silently decode to zero values.
 func TestDiscoveryUsesLowerCamelFields(t *testing.T) {
-	h := discoveryServer(t, config.Default(),
+	cfg := config.Default()
+	cfg.Token = testBearerToken
+	h := discoveryServer(t, cfg,
 		registry.AgentInfo{Name: "claude", DisplayName: "Claude", Endpoint: "/acp/claude", Available: true, Version: "2.1.328"},
 	)
 
-	rec := getDiscovery(t, h, "")
+	rec := getDiscovery(t, h, testBearerToken)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -89,14 +93,16 @@ func TestDiscoveryUsesLowerCamelFields(t *testing.T) {
 // Discovery order must not depend on map iteration; a client that remembers the
 // first available agent would otherwise pick a different one per request.
 func TestDiscoveryOrdersAgentsByName(t *testing.T) {
-	h := discoveryServer(t, config.Default(),
+	cfg := config.Default()
+	cfg.Token = testBearerToken
+	h := discoveryServer(t, cfg,
 		registry.AgentInfo{Name: "codex", DisplayName: "Codex", Endpoint: "/acp/codex"},
 		registry.AgentInfo{Name: "claude", DisplayName: "Claude", Endpoint: "/acp/claude"},
 		registry.AgentInfo{Name: "amp", DisplayName: "Amp", Endpoint: "/acp/amp"},
 	)
 
 	var got discoveryResponse
-	rec := getDiscovery(t, h, "")
+	rec := getDiscovery(t, h, testBearerToken)
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -140,5 +146,17 @@ func TestDiscoveryRejectsWithoutBearer(t *testing.T) {
 	}
 	if rec := getDiscovery(t, h, "s3cret"); rec.Code != http.StatusOK {
 		t.Errorf("right token status = %d, want 200", rec.Code)
+	}
+}
+
+func TestDiscoveryRejectsBlankConfiguredToken(t *testing.T) {
+	for _, token := range []string{"", " \t"} {
+		cfg := config.Default()
+		cfg.Token = token
+		h := discoveryServer(t, cfg)
+
+		if rec := getDiscovery(t, h, ""); rec.Code != http.StatusUnauthorized {
+			t.Errorf("configured token %q: status = %d, want 401", token, rec.Code)
+		}
 	}
 }

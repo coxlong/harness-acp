@@ -17,17 +17,15 @@ func bearerToken(r *http.Request) string {
 }
 
 // authMiddleware wraps a handler to require a bearer token.
-// If token is empty, all requests pass through (dev mode).
+// An empty or whitespace-only configured token rejects every request.
 //
 // A rejection is a JSON 401 with a WWW-Authenticate challenge, so a client can
 // tell "wrong token" from "server unreachable" instead of guessing at an HTML
 // error page.
 func authMiddleware(token string, next http.Handler) http.Handler {
-	if token == "" {
-		return next
-	}
+	configured := strings.TrimSpace(token) != ""
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !tokenMatches(bearerToken(r), token) {
+		if !configured || !tokenMatches(bearerToken(r), token) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="harnessd"`)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
